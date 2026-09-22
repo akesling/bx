@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# pi.resolve — host-side resolution for the pi recipe.
+#
+# This is the *only* part of the pi recipe that runs code, and it is a program
+# referenced by name from pi.conf (`resolve = pi.resolve`). Everything it
+# produces is emitted as recipe values, so pi.conf itself stays data.
+#
+# It mirrors the Subconscious launcher's resolution order:
+#   gateway  SUBCONSCIOUS_BASE_URL   -> profile GATEWAY_URL -> registry -> default
+#   model    SUBCONSCIOUS_MODEL      -> profile MODEL       -> default
+#   key      SUBCONSCIOUS_API_KEY    -> profile key         -> config.json
+#
+# It prints recipe key=value lines (see recipes/README.md). Secrets are
+# emitted as `secret_env` *names*, never as values, so they cross into the
+# guest through smolvm --secret-env and never appear in argv or in state.
+
+set -euo pipefail
+
+_die() { printf 'pi.resolve: %s\n' "$*" >&2; exit 1; }
+
+# ── inputs ──────────────────────────────────────────────────────────────────
+# Host directory to mount and run in. The recipe's own `mounts` uses $PWD; the
+# resolver only needs it to derive the machine name and the agent config path.
+_dir="${BX_PI_DIR:-$PWD}"
+[[ -d "$_dir" ]] || _die "$_dir is not a directory"
+_dir="$(cd "$_dir" && pwd)"
+
+_config_dir="${SUBC_CONFIG_DIR:-$HOME/.subconscious}"
+[[ -d "$_config_dir" ]] || _config_dir="$HOME/.subconscious"
+_config_json="${_config_dir}/config.json"
+
+# ── profile selection ───────────────────────────────────────────────────────
+_profile="${BX_PI_PROFILE:-}"
+if [[ -z "$_profile" && -f "$_config_json" ]]; then
+  _profile="$(sed -n 's/^"active_profile"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$_config_json" | head -1)"
+fi
+if [[ -n "$_profile" && "$_profile" != "default" ]]; then
+  _profile_file="${_config_dir}/profiles/${_profile}.env"
+else
+  _profile_file="${_config_dir}/profiles/default.env"
+  _profile="default"
+fi
+
+_profile_value() {
+  [[ -f "$_profile_file" ]] || return 0
+  sed -n "s/^$1=//p" "$_profile_file" | tail -1
+}
+
+# `defaults` from registry.generated.json of the installed subconscious-cli.
+_registry_default() {
+  local _key="$1" _file _value
+  for _file in "${SUBCONSCIOUS_RUNBOOK_DIR:-}/registry.generated.json" \
+               "$HOME"/.bun/install/cache/subconscious-cli@*/bin/registry.generated.json \
+               "$HOME"/.bun/install/global/node_modules/subconscious-cli/bin/registry.generated.json; do
+    [[ -f "$_file" ]] || continue
+    _value="$(python3 - "$_file" "$_key" <<'PY' 2>/dev/null
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("defaults", {}).get(sys.argv[2], ""))
+except Exception:
+    pass
+PY
+)"
+    [[ -n "$_value" ]] && { printf '%s' "$_value"; return 0; }
+  done
+}
+
+_profile_gateway="$(_profile_value GATEWAY_URL)"
+_profile_model="$(_profile_value MODEL)"
+_profile_key="$(_profile_value PI_API_KEY)"
+[[ -n "$_profile_key" ]] || _profile_key="$(_profile_value API_KEY)"
+
+_gateway="${SUBCONSCIOUS_BASE_URL:-${_profile_gateway:-}}"
+[[ -n "$_gateway" ]] || _gateway="$(_registry_default baseUrl)"
+[[ -n "$_gateway" ]] || _gateway="https://api.subconscious.dev"
+
+# `subc` exports a bare MODEL into every launch, so the profile file must
+# outrank the ambient variable: the profile is the configured choice. An
+# explicit --model / BX_PI_MODEL wins over both.
+_model="${BX_PI_MODEL:-${SUBCONSCIOUS_MODEL:-${_profile_model:-}}}"
+[[ -n "$_model" ]] || _model="subconscious/deepseek-v4.1-flash-marathon"
+
+_key="${SUBCONSCIOUS_API_KEY:-${PI_API_KEY:-${_profile_key:-}}}"
+if [[ -z "$_key" && -f "$_config_json" ]]; then
+  _key="$(python3 - "$_config_json" <<'PY' 2>/dev/null
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("subconscious_api_key", ""))
+except Exception:
+    pass
+PY
+)"
+fi
+[[ -n "$_key" ]] || _die "no Subconscious key found; run \`subc login\` or set SUBCONSCIOUS_API_KEY"
+
+_context_window="${PI_CONTEXT_WINDOW:-$(_profile_value PI_CONTEXT_WINDOW)}"
+_max_tokens="${PI_MAX_TOKENS:-$(_profile_value PI_MAX_TOKENS)}"
+_context_window="${_context_window:-5000000}"
+_max_tokens="${_max_tokens:-65536}"
+
+# The compaction extension is observational and optional. Resolve the runbook
+# from the installed CLI rather than pinning a version.
+if [[ -z "${SUBCONSCIOUS_RUNBOOK_DIR:-}" ]]; then
+  for _candidate in "$HOME"/.bun/install/cache/subconscious-cli@*/bin/runbook \
+                    "$HOME"/.bun/install/global/node_modules/subconscious-cli/bin/runbook; do
+    [[ -d "$_candidate" ]] && { SUBCONSCIOUS_RUNBOOK_DIR="$_candidate"; break; }
+  done
+fi
+_extension="${SUBCONSCIOUS_RUNBOOK_DIR:-}/pi/subconscious-compaction.ts"
+[[ -f "$_extension" ]] || _extension=""
+
+# A machine per working directory. smolvm allows only [A-Za-z0-9_-], so reduce
+# the directory name rather than passing it through.
+_dir_slug="$(printf '%s' "$(basename "$_dir")" \
+  | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/--*/-/g; s/^-//; s/-$//')"
+[[ -n "$_dir_slug" ]] || _dir_slug="work"
+
+# ── emit recipe values ──────────────────────────────────────────────────────
+# Params first, so `$NAME` references in pi.conf resolve. Parameter values are
+# not secret and may appear in values; secrets cross by name via secret_env.
+printf '@param AGENT_MODEL=%s\n' "$_model"
+printf '@param AGENT_CONTEXT_WINDOW=%s\n' "$_context_window"
+printf '@param AGENT_MAX_TOKENS=%s\n' "$_max_tokens"
+printf 'name=%s\n' "pi-${_dir_slug}"
+
+# Secrets cross into the guest by name; the host variables are exported by the
+# resolver's caller (bx) for the bootstrap to read via secret_env.
+printf 'secret_env=GATEWAY_URL=BX_PI_SECRET_GATEWAY\n'
+printf 'secret_env=API_KEY=BX_PI_SECRET_KEY\n'
+printf 'secret_env=MODEL=BX_PI_SECRET_MODEL\n'
+printf 'secret_env=PI_CONTEXT_WINDOW=BX_PI_SECRET_CONTEXT_WINDOW\n'
+printf 'secret_env=PI_MAX_TOKENS=BX_PI_SECRET_MAX_TOKENS\n'
+
+# The extension, if present, is copied into the guest before the bootstrap.
+if [[ -n "$_extension" ]]; then
+  printf 'bootstrap_env=EXTENSION_PATH=/tmp/subconscious-compaction.ts\n'
+  printf 'pre_command=smolvm machine cp %s pi-${_dir_slug}:/tmp/subconscious-compaction.ts --mode 644 >/dev/null\n' \
+    "$(printf '%q' "$_extension")"
+fi
+
+# The values the bootstrap and launch need. Emitted as secret_env *sources*,
+# which bx turns into the BX_PI_SECRET_* host variables it passes by name.
+# (See the keys above: the guest variable is on the left of `=`.)
+printf 'bootstrap_env=GATEWAY_URL\n'
+printf 'bootstrap_env=MODEL\n'
+printf 'bootstrap_env=PI_CONTEXT_WINDOW\n'
+printf 'bootstrap_env=PI_MAX_TOKENS\n'
+
+# Hand the secret values to bx out of band, so they never land in the resolved
+# recipe on disk, in `--show` output, or in argv.
+printf '@secret BX_PI_SECRET_GATEWAY=%s\n' "$_gateway"
+printf '@secret BX_PI_SECRET_KEY=%s\n' "$_key"
+printf '@secret BX_PI_SECRET_MODEL=%s\n' "$_model"
+printf '@secret BX_PI_SECRET_CONTEXT_WINDOW=%s\n' "$_context_window"
+printf '@secret BX_PI_SECRET_MAX_TOKENS=%s\n' "$_max_tokens"
+
+exit 0

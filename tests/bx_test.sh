@@ -357,13 +357,277 @@ test_recipe_unknown_name_is_rejected() {
 }
 
 test_recipe_list() {
-  _current="--list shows recipes plus the built-in pi"
+  _current="--list shows the shipped book and user recipes"
   local out
   _recipe_env
   printf '[alpha]\ncommand = true\n' >"$_rproj/.bx.conf"
   out="$(_run_recipe_bx --list)"
   assert_contains "alpha" "$out" "lists alpha"
-  assert_contains "pi" "$out" "lists pi"
+  assert_contains "pi" "$out" "lists the shipped pi recipe"
+  assert_contains "sandbox" "$out" "lists the shipped sandbox recipe"
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_book_is_not_compiled_in() {
+  _current="bx resolves the shipped recipes with no pi-specific code in bx"
+  local out
+  _recipe_env
+  out="$(_run_recipe_bx --show sandbox)"
+  assert_contains "recipe=sandbox" "$out" "resolves the shipped sandbox recipe"
+  # The point of the book: bx itself must not name any particular recipe.
+  if grep -qi 'subconscious\|\bbx-pi\b' "$_bx"; then
+    _fail "bx names a specific recipe's provider"
+  else
+    _ok
+  fi
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_extends_inherits_scalars_and_lists() {
+  _current="extends inherits scalars and prepends lists"
+  local out
+  _recipe_env
+  cat >"$_rproj/.bx.conf" <<'EOF'
+[base]
+image = alpine
+cpus = 1
+mounts = /base:/base
+[child]
+extends = base
+command = true
+mounts = /child:/child
+cpus = 2
+EOF
+  out="$(_run_recipe_bx --show child)"
+  assert_contains "cpus=2" "$out" "child overrides a scalar"
+  assert_contains "image=alpine" "$out" "child inherits image"
+  if [[ "${out%%/child:/child*}" == *"/base:/base"* ]]; then _ok; else _fail "base mount did not precede child"; fi
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_resolver_emits_values() {
+  _current="a resolver's values merge and its params interpolate"
+  local out
+  _recipe_env
+  cat >"${_rproj}/mk.resolve" <<'EOF'
+#!/usr/bin/env bash
+printf '@param GREETING=hi\n'
+printf 'name=resolved-name\n'
+printf 'command=echo $GREETING\n'
+EOF
+  chmod +x "${_rproj}/mk.resolve"
+  cat >"$_rproj/.bx.conf" <<'EOF'
+[r]
+resolve = mk.resolve
+command = default
+EOF
+  out="$(BX_RECIPES_DIR="$_rproj" _run_recipe_bx --show r)"
+  assert_contains "name=resolved-name" "$out" "resolver sets the machine name"
+  assert_contains "echo hi" "$out" "param interpolated into a value"
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_resolver_secrets_stay_out_of_show() {
+  _current="resolver secrets are never printed by --show"
+  local out
+  _recipe_env
+  cat >"${_rproj}/sec.resolve" <<'EOF'
+#!/usr/bin/env bash
+printf '@secret MY_SECRET=swordfish\n'
+printf 'command = true\n'
+EOF
+  chmod +x "${_rproj}/sec.resolve"
+  printf '[s]\nresolve = sec.resolve\ncommand = true\n' >"$_rproj/.bx.conf"
+  out="$(BX_RECIPES_DIR="$_rproj" _run_recipe_bx --show s)"
+  assert_not_contains "swordfish" "$out" "secret value is not printed"
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_resolver_missing_is_reported() {
+  _current="a missing resolver is a clear error"
+  local out
+  _recipe_env
+  printf '[x]\nresolve = no-such-resolver\ncommand = true\n' >"$_rproj/.bx.conf"
+  out="$(_run_recipe_bx --show x)"
+  assert_contains "resolve 'no-such-resolver' not found" "$out" "names the missing resolver"
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_new_scaffolds() {
+  _current="--new writes a starter recipe into the user's book"
+  local out
+  _recipe_env
+  out="$(HOME="$_rhome" _run_recipe_bx --new mine)"
+  assert_contains "wrote" "$out" "reports the file"
+  if [[ -f "${_rhome}/.bx/recipes/mine.conf" ]]; then _ok; else _fail "recipe file was not written"; fi
+  # Scaffolding twice must not clobber an edited recipe.
+  out="$(HOME="$_rhome" _run_recipe_bx --new mine)"
+  assert_contains "already exists" "$out" "refuses to overwrite"
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_machine_is_a_separate_dir() {
+  _current="a command recipe names a machine from ~/.bx/machines"
+  local out
+  _recipe_env
+  mkdir -p "$_rhome/.bx/machines" "$_rhome/.bx/recipes"
+  cat >"$_rhome/.bx/machines/small.conf" <<'EOF'
+[small]
+image = alpine
+cpus = 1
+mem = 512
+mounts = $PWD:/work
+EOF
+  cat >"$_rhome/.bx/recipes/dothing.conf" <<'EOF'
+[dothing]
+machine = small
+command = true
+EOF
+  out="$(_run_recipe_bx --show dothing)"
+  assert_contains "recipe=dothing" "$out" "resolves the command recipe"
+  assert_contains "image=alpine" "$out" "takes the machine's image"
+  assert_contains "cpus=1" "$out" "takes the machine's cpus"
+  assert_contains "command=true" "$out" "keeps the recipe's command"
+  assert_contains "machine:small" "$out" "provenance credits the machine"
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_machine_overrides() {
+  _current="a command recipe overrides its machine's shape keys"
+  local out
+  _recipe_env
+  mkdir -p "$_rhome/.bx/machines" "$_rhome/.bx/recipes"
+  printf '[base]\nimage = alpine\ncpus = 2\nmem = 1024\nmounts = $PWD:/work\n' \
+    >"$_rhome/.bx/machines/base.conf"
+  printf '[job]\nmachine = base\ncpus = 8\ncommand = true\n' \
+    >"$_rhome/.bx/recipes/job.conf"
+  out="$(_run_recipe_bx --show job)"
+  assert_contains "cpus=8" "$out" "recipe overrides cpus"
+  assert_contains "mem=1024" "$out" "keeps machine mem"
+  assert_contains "job.cpus=recipe" "$out" "provenance credits the override"
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_machine_flag_replaces_shape() {
+  _current="--machine replaces the recipe's machine and its overrides"
+  local out
+  _recipe_env
+  mkdir -p "$_rhome/.bx/machines" "$_rhome/.bx/recipes"
+  printf '[small]\nimage = alpine\ncpus = 1\nmem = 512\nmounts = $PWD:/work\n' \
+    >"$_rhome/.bx/machines/small.conf"
+  printf '[big]\nimage = debian:bookworm-slim\ncpus = 16\nmem = 32768\nmounts = $PWD:/work\n' \
+    >"$_rhome/.bx/machines/big.conf"
+  printf '[job]\nmachine = small\ncpus = 8\ncommand = true\n' \
+    >"$_rhome/.bx/recipes/job.conf"
+  out="$(_run_recipe_bx --machine=big --show job)"
+  assert_contains "cpus=16" "$out" "uses the named machine's cpus"
+  assert_contains "mem=32768" "$out" "uses the named machine's mem"
+  assert_contains "job.cpus=ignored:--machine" "$out" "reports the override as ignored"
+  assert_contains "command=true" "$out" "keeps the recipe's command"
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_machine_flag_via_env() {
+  _current="BX_MACHINE selects a machine like --machine"
+  local out
+  _recipe_env
+  mkdir -p "$_rhome/.bx/machines" "$_rhome/.bx/recipes"
+  printf '[big]\nimage = debian:bookworm-slim\ncpus = 16\nmem = 32768\nmounts = $PWD:/work\n' \
+    >"$_rhome/.bx/machines/big.conf"
+  printf '[job]\ncommand = true\n' >"$_rhome/.bx/recipes/job.conf"
+  out="$( cd "$_rproj" && HOME="$_rhome" BX_MACHINE=big \
+    PATH="${_fake_bin_dir}:$PATH" XDG_STATE_HOME="$_rproj/state" \
+    "$_bx" --show job 2>&1 )"
+  assert_contains "cpus=16" "$out" "environment picks the machine"
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_machine_unknown_is_reported() {
+  _current="an unknown machine reference is an error"
+  local out rc
+  _recipe_env
+  mkdir -p "$_rhome/.bx/recipes"
+  printf '[job]\nmachine = ghost\ncommand = true\n' >"$_rhome/.bx/recipes/job.conf"
+  out="$(_run_recipe_bx --show job)"; rc=$?
+  assert_eq "1" "$rc" "exits nonzero"
+  assert_contains "machine 'ghost' is not defined" "$out" "names the missing machine"
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_machine_self_reference_is_rejected() {
+  _current="a recipe cannot name itself as its machine"
+  local out rc
+  _recipe_env
+  mkdir -p "$_rhome/.bx/recipes"
+  printf '[job]\nmachine = job\ncommand = true\n' >"$_rhome/.bx/recipes/job.conf"
+  out="$(_run_recipe_bx --show job)"; rc=$?
+  assert_eq "1" "$rc" "exits nonzero"
+  assert_contains "refers to itself" "$out" "explains the self-reference"
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_flat_file_holds_both_kinds() {
+  _current="a .bx.conf holds machine and command sections together"
+  local out
+  _recipe_env
+  cat >"$_rhome/.bx.conf" <<'EOF'
+[tiny]
+image = busybox
+cpus = 1
+mem = 256
+[job]
+machine = tiny
+command = echo hi
+EOF
+  out="$(_run_recipe_bx --show job)"
+  assert_contains "recipe=job" "$out" "resolves the command section"
+  assert_contains "image=busybox" "$out" "takes the machine section's image"
+  assert_contains "command=echo hi" "$out" "keeps the command"
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_hyphen_name_is_rejected() {
+  _current="a hyphenated recipe name is rejected clearly"
+  local out rc
+  _recipe_env
+  mkdir -p "$_rhome/.bx/machines"
+  printf '[go-test]\ncommand = true\n' >"$_rhome/.bx/machines/bad.conf"
+  out="$(_run_recipe_bx --show go-test)"; rc=$?
+  assert_eq "1" "$rc" "exits nonzero"
+  assert_contains "recipe name 'go-test' is invalid" "$out" "explains the bad name"
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_machine_recipe_has_no_command() {
+  _current="running a machine recipe directly explains itself"
+  local out rc
+  _recipe_env
+  mkdir -p "$_rhome/.bx/machines"
+  printf '[bare]\nimage = alpine\ncpus = 1\nmounts = $PWD:/work\n' \
+    >"$_rhome/.bx/machines/bare.conf"
+  out="$(_run_recipe_bx bare)"; rc=$?
+  assert_eq "1" "$rc" "exits nonzero"
+  assert_contains "machine recipe" "$out" "names the kind of recipe"
+  assert_contains "machine = bare" "$out" "shows how to use it"
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_machine_extends_inherits() {
+  _current="a machine recipe's extends is inherited when referenced"
+  local out
+  _recipe_env
+  mkdir -p "$_rhome/.bx/machines" "$_rhome/.bx/recipes"
+  printf '[base]\nimage = alpine\ncpus = 1\nmem = 256\nmounts = $PWD:/work\n' \
+    >"$_rhome/.bx/machines/base.conf"
+  printf '[derived]\nextends = base\ncpus = 8\n' \
+    >"$_rhome/.bx/machines/derived.conf"
+  printf '[job]\nmachine = derived\ncommand = true\n' \
+    >"$_rhome/.bx/recipes/job.conf"
+  out="$(_run_recipe_bx --show job)"
+  assert_contains "image=alpine" "$out" "inherits image from the base"
+  assert_contains "mem=256" "$out" "inherits mem from the base"
+  assert_contains "cpus=8" "$out" "keeps the derived cpus"
+  assert_contains "machine:derived" "$out" "provenance credits the machine"
   rm -rf "$_rhome" "$_rproj"
 }
 
@@ -403,7 +667,23 @@ test_recipe_variable_expansion
 test_recipe_unknown_key_is_rejected
 test_recipe_unknown_name_is_rejected
 test_recipe_list
+test_recipe_book_is_not_compiled_in
+test_recipe_extends_inherits_scalars_and_lists
+test_recipe_resolver_emits_values
+test_recipe_resolver_secrets_stay_out_of_show
+test_recipe_resolver_missing_is_reported
+test_recipe_new_scaffolds
 test_recipe_profile_hands_off
+test_recipe_machine_is_a_separate_dir
+test_recipe_machine_overrides
+test_recipe_machine_flag_replaces_shape
+test_recipe_machine_flag_via_env
+test_recipe_machine_unknown_is_reported
+test_recipe_machine_self_reference_is_rejected
+test_recipe_flat_file_holds_both_kinds
+test_recipe_hyphen_name_is_rejected
+test_recipe_machine_recipe_has_no_command
+test_recipe_machine_extends_inherits
 
 printf '\n%d passed, %d failed\n' "$_passed" "$_failed"
 [[ "$_failed" -eq 0 ]]

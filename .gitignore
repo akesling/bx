@@ -2,3 +2,5 @@
 local/
 # Staged package roots and install prefixed builds.
 staging/
+# Local agent state (pi session/auth/models) — never part of the repo.
+.pi/

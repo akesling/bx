@@ -4,21 +4,38 @@
 # Usage:
 #   bx <recipe> [args...]   # run a recipe (e.g. `bx pi`)
 #   bx --list               # list available recipes
-#   bx --show <recipe>      # print the resolved recipe without running it
+#   bx --show <recipe>      # print the resolved recipe, with provenance
 #   bx --dry-run <recipe>   # print the machine plan without touching smolvm
+#   bx --new <recipe>       # scaffold a recipe in ~/.bx/recipes
+#   bx --machine <name> <recipe>  # run a recipe on the named machine
 #   bx --help
 #
-# Recipes are declarative: `[name]` followed by `key = value` lines, read from
-# (in increasing precedence) the built-in defaults, ~/.bx.conf, ./.bx.conf, and
-# per-recipe files under ~/.bx/recipes/ and ./.bx/recipes/. A recipe inherits
-# the home and project defaults and may override any setting. Only `command`
-# is required; the built-in `pi` recipe is always available.
+# Recipes are declarative: `[name]` followed by `key = value` lines. The
+# recipe book is the product; bx is the interpreter. See recipes/README.md for
+# the format. Sources are read in increasing precedence: the shipped machines/
+# and recipes/, ~/.bx.conf, ./.bx.conf, then ~/.bx/machines/, ./.bx/machines/,
+# ~/.bx/recipes/, and ./.bx/recipes/. Only `command` is required. No recipe is
+# compiled into bx.
 #
-# Recipe keys (every bx setting):
+# A section with a `command` is a command recipe; one without is a machine
+# recipe. A command recipe may name a machine (`machine = libc-dev`) and
+# override any of its shape keys. `--machine` on the command line replaces the
+# shape entirely: the named machine is used as-is and the command recipe's
+# machine reference and shape keys are ignored, while its command and
+# lifecycle flags survive. `--name` overrides a recipe's machine identity.
+#
+# A recipe may `extends` another (base values are inherited) and may `resolve`
+# a resolver: a program referenced by name that emits recipe values. The
+# resolver is the only way a recipe runs host code; recipe values are data and
+# are never shell-evaluated.
+#
+# Recipe keys (every bx setting, plus four):
 #   command, image, name, cpus, mem, net, mounts, workdir, keep, reset,
-#   bootstrap, bootstrap_env, secret_env, pre_command, state_dir
+#   bootstrap, bootstrap_env, secret_env, pre_command, name, state_dir,
+#   profile, extends, resolve, machine
 # `mounts`, `bootstrap_env`, and `secret_env` may repeat; their lines are kept
-# in order. `#` starts a comment; values run to end of line after trimming.
+# in order. `#` starts a comment; values run to end of line after trimming. A
+# value continues on following lines if those lines are indented.
 #
 # The command runs through `bash -lc` (or `-i -t` when attached to a terminal)
 # and its exit status becomes this script's exit status. Extra arguments after
@@ -42,7 +59,7 @@ _die() { printf 'bx: %s\n' "$*" >&2; exit 1; }
 _note() { printf 'bx: %s\n' "$*" >&2; }
 
 _usage() {
-  sed -n '2,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,44p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # ── recipes ─────────────────────────────────────────────────────────────────
@@ -56,8 +73,25 @@ _usage() {
 # last file read wins) and appends to a multi-valued key (so all sources
 # contribute, in the order read: home, project, per-recipe).
 
-_recipe_keys="command image name cpus mem net mounts workdir keep reset bootstrap bootstrap_env secret_env pre_command state_dir profile"
+_recipe_keys="command image name cpus mem net mounts workdir keep reset bootstrap bootstrap_env secret_env pre_command state_dir profile extends resolve machine"
 _multi_keys="mounts bootstrap_env secret_env"
+
+# A recipe key that is not a bx setting but describes the recipe itself.
+# `extends` and `resolve` are resolved before the recipe is merged.
+_meta_keys="extends resolve machine"
+
+# The keys that define a machine's shape: identity, image, resources, mounts,
+# and the one-time setup that must match them. A machine recipe is a section
+# with some of these and no `command`. A command recipe may name a machine with
+# `machine = ...` and override any of these keys; `--machine` on the command
+# line replaces them all. Kept as data so the two rules live in one place.
+_shape_keys="image name cpus mem net mounts workdir bootstrap bootstrap_env secret_env pre_command state_dir"
+
+_is_shape_key() {
+  local _k
+  for _k in $_shape_keys; do [[ "$_k" == "$1" ]] && return 0; done
+  return 1
+}
 
 _known_key() {
   local _k
@@ -79,16 +113,57 @@ _trim() {
   printf '%s' "$_s"
 }
 
+# Set `_cfg_<name>_<key>` to `value` without interpreting `value` as shell.
+# `printf -v` assigns through a variable name, so a value containing `$`,
+# backticks, or quotes is stored literally. This is what makes the "values are
+# data, not shell" guarantee real rather than aspirational.
+_store_scalar() { # name key value
+  printf -v "_cfg_$1_$2" '%s' "$3"
+}
+
+_store_append() { # name key value
+  local _var="_cfg_$1_$2" _old
+  _old="${!_var:-}"
+  printf -v "$_var" '%s%s' "${_old:+${_old}
+}" "$3"
+}
+
 _load_file() {
-  local _file="$1" _line _section="" _key _val
+  local _file="$1" _line _section="" _key _val _continuation=0
   [[ -f "$_file" ]] || return 0
   while IFS= read -r _line || [[ -n "$_line" ]]; do
+    # A value continues onto following lines until a new `key = value`, a new
+    # `[section]`, or a blank line. This is how a multi-line `bootstrap` is
+    # written. Continuation lines lose only their common reading: a line that
+    # is itself `key = value` (for a known key) starts a new key instead.
+    if [[ "$_continuation" == 1 ]]; then
+      _candidate="$(_trim "${_line%%#*}")"
+      if [[ -z "$_candidate" ]]; then
+        _continuation=0; continue
+      elif [[ "$_candidate" == '['*']' ]]; then
+        _continuation=0 # a new section ends the value; handled below
+      elif [[ "$_candidate" == *=* ]]; then
+        _ck="$(_trim "${_candidate%%=*}")"
+        _known_key "$_ck" && _continuation=0
+      fi
+      if [[ "$_continuation" == 1 ]]; then
+        _store_append "$_section" "$_key" "$_line"
+        continue
+      fi
+    fi
+    _continuation=0
     _line="$(_trim "${_line%%#*}")"
     [[ -n "$_line" ]] || continue
     if [[ "$_line" == '['*']' ]]; then
       _section="$(_trim "${_line#[}")"
       _section="$(_trim "${_section%]}")"
       [[ -n "$_section" ]] || _die "$_file: empty recipe name"
+      # The loader stores keys in variables named _cfg_<recipe>_<key>, so a
+      # recipe name must be a shell identifier. A hyphen is rejected here
+      # rather than failing later with a confusing `printf` error.
+      case "$_section" in
+        *[!A-Za-z0-9_]*) _die "$_file: recipe name '${_section}' is invalid; use letters, digits, or '_'" ;;
+      esac
       case "$_recipe_names" in
         *"
 ${_section}
@@ -99,15 +174,18 @@ ${_section}
       continue
     fi
     [[ -n "$_section" ]] || _die "$_file: line outside a [recipe]: $_line"
+    [[ "$_line" == *=* ]] || _die "$_file: expected 'key = value': $_line"
     _key="$(_trim "${_line%%=*}")"
     _val="$(_trim "${_line#*=}")"
-    [[ "$_line" == *=* ]] || _die "$_file: expected 'key = value': $_line"
     _known_key "$_key" || _die "$_file: unknown key '$_key' in [$_section]"
-    # Expand the three references a recipe author actually reaches for, so a
-    # mount can be written `$PWD:/work` or `~/src:/src`. Nothing else is
-    # expanded: values are not shell-evaluated, so a recipe cannot run code.
+
+    # Expand the references a recipe author actually reaches for, so a mount
+    # can be written `$PWD:/work` or `~/src:/src`. `$NAME` references to
+    # resolver params are substituted at resolve time, not here, because the
+    # resolver has not run yet. Nothing else is expanded: values are not
+    # shell-evaluated, so a recipe cannot run code.
     case "$_val" in
-      *\$PWD*|*\$HOME*|*'~'*)
+      *'$PWD'*|*'$HOME'*|*'~'*)
         _val="${_val//\$PWD/$PWD}"
         _val="${_val//\$HOME/${HOME:-}}"
         # A leading ~ is the home directory; there is no other tilde form here.
@@ -116,12 +194,13 @@ ${_section}
           "~")   _val="${HOME:-}" ;;
         esac ;;
     esac
+
     if _is_multi_key "$_key"; then
-      eval "_cfg_${_section}_${_key}=\"\${_cfg_${_section}_${_key}:+\${_cfg_${_section}_${_key}}
-}${_val}\""
+      _store_append "$_section" "$_key" "$_val"
     else
-      eval "_cfg_${_section}_${_key}=\$_val"
+      _store_scalar "$_section" "$_key" "$_val"
     fi
+    _continuation=1
   done <"$_file"
 }
 
@@ -129,7 +208,6 @@ ${_section}
 _recipe_names=""
 _has_recipe() {
   local _name="$1"
-  [[ "$_name" == "pi" ]] && return 0
   case "
 ${_recipe_names}" in
     *"
@@ -139,64 +217,259 @@ ${_name}
   return 1
 }
 
+# The shipped recipe book, beside the installed bx or in a checkout. Kept out
+# of _recipe_names until loaded, but its location is remembered so `resolve`
+# can find a resolver that lives in the book rather than on PATH.
+_recipes_dir() {
+  local _d _self
+  _self="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo .)"
+  for _d in "${BX_RECIPES_DIR:-}" \
+            "${_self}/../share/bx/recipes" \
+            "${_self}/../recipes" \
+            "$(dirname "$(command -v bx 2>/dev/null || echo .)")/../share/bx/recipes"; do
+    [[ -n "$_d" && -d "$_d" ]] && { (cd "$_d" && pwd); return 0; }
+  done
+  return 0
+}
+
+# The book directory holding machine recipes. Machines live beside the command
+# recipes in the source tree and install prefix, so discovery mirrors
+# _recipes_dir; the set of directories is what differs.
+_machines_dir() {
+  local _d _self
+  _self="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo .)"
+  for _d in "${BX_MACHINES_DIR:-}" \
+            "${_self}/../share/bx/machines" \
+            "${_self}/../machines" \
+            "$(dirname "$(command -v bx 2>/dev/null || echo .)")/../share/bx/machines"; do
+    [[ -n "$_d" && -d "$_d" ]] && { (cd "$_d" && pwd); return 0; }
+  done
+  return 0
+}
+
+_load_dir() { # directory
+  local _d="$1" _f
+  [[ -n "$_d" && -d "$_d" ]] || return 0
+  for _f in "$_d"/*.conf; do
+    [[ -f "$_f" ]] || continue
+    _load_file "$_f"
+  done
+}
+
 _recipe_list() {
   local _r
-  for _r in $_recipe_names pi; do
+  for _r in $_recipe_names; do
     [[ -n "$_r" ]] && printf '%s\n' "$_r"
   done | sort -u
   return 0
 }
 
 # Load every config source into scope. Call once, before resolving a recipe.
+#
+# Precedence (increasing), so a later source overrides an earlier one:
+#   shipped machines/, shipped recipes/,
+#   ~/.bx.conf, ./.bx.conf,
+#   ~/.bx/machines/, ./.bx/machines/,
+#   ~/.bx/recipes/,  ./.bx/recipes/
+#
+# Flat .bx.conf files may hold both kinds: a section with a `command` is a
+# command recipe, one without is a machine recipe. Machine and command dirs are
+# separate so the common case (many commands, few machines) reads clearly, but
+# the grammar is identical and both may be loaded from either place.
 _load_sources() {
   _recipe_names=""
+  local _book _mdir
+  _book="$(_recipes_dir)"
+  _mdir="$(_machines_dir)"
+  _load_dir "$_mdir"
+  _load_dir "$_book"
   _load_file "${HOME:-}/.bx.conf"
   _load_file "./.bx.conf"
-  local _rf
-  for _rf in "${HOME:-}/.bx/recipes" ./.bx/recipes; do
-    [[ -d "$_rf" ]] || continue
-    local _f
-    for _f in "$_rf"/*.conf; do
-      [[ -f "$_f" ]] || continue
-      _load_file "$_f"
+  _load_dir "${HOME:-}/.bx/machines"
+  _load_dir "./.bx/machines"
+  _load_dir "${HOME:-}/.bx/recipes"
+  _load_dir "./.bx/recipes"
+}
+
+# Record where each resolved key's winning value came from, for `--show`.
+_prov=""
+_provenance() { _prov="${_prov}${1}=${2}
+"; }
+
+# Split one `key = value` line and merge it into `_cfg_<recipe>_<key>`, applying
+# the scalar/lists rules. `source` names where it came from for provenance.
+_merge_recipe_line() {
+  local _name="$1" _line="$2" _source="$3" _key _val _p _pv
+  _key="$(_trim "${_line%%=*}")"
+  _val="$(_trim "${_line#*=}")"
+  _known_key "$_key" || _die "[${_name}] resolver produced unknown key '${_key}'"
+  # Substitute resolver params into the value (`$AGENT_MODEL` and friends).
+  for _p in $_params; do
+    eval "_pv=\${_param_${_p}}"
+    _val="${_val//\$${_p}/${_pv}}"
+  done
+  if _is_multi_key "$_key"; then
+    _store_append "$_name" "$_key" "$_val"
+  else
+    _store_scalar "$_name" "$_key" "$_val"
+  fi
+  _provenance "${_name}.${_key}" "$_source"
+}
+
+# Run a recipe's resolver: a program referenced by name that emits recipe
+# key=value lines, plus `@param N=V` and `@secret N=V` directives. It is the
+# only way a recipe runs host code. See recipes/README.md.
+_run_resolver() {
+  local _name="$1" _resolve="$2" _book _exe _line _key _val
+  [[ -n "$_resolve" ]] || return 0
+  _book="$(_recipes_dir)"
+  _exe=""
+  case "$_resolve" in
+    */*) [[ -x "$_resolve" ]] && _exe="$_resolve" ;;
+    *)   if [[ -n "$_book" && -x "${_book}/${_resolve}" ]]; then _exe="${_book}/${_resolve}"
+         elif command -v "$_resolve" >/dev/null 2>&1; then _exe="$(command -v "$_resolve")"; fi ;;
+  esac
+  [[ -n "$_exe" ]] || _die "[${_name}] resolve '${_resolve}' not found (looked in the book and PATH)"
+  while IFS= read -r _line || [[ -n "$_line" ]]; do
+    [[ -n "$_line" ]] || continue
+    case "$_line" in
+      '#'*) continue ;;
+      '@param '*) _key="${_line#@param }"; _val="${_key#*=}"; _key="${_key%%=*}"
+                  eval "_param_${_key}=\$_val"; _params="${_params} ${_key}" ;;
+      '@secret '*)
+        _key="${_line#@secret }"; _val="${_key#*=}"; _key="${_key%%=*}"
+        export "${_key}=${_val}" ;;
+      '@'*) continue ;;
+      *=*) _merge_recipe_line "$_name" "$_line" "resolver:${_resolve}" ;;
+      *) _die "[${_name}] resolver ${_resolve}: unexpected output: ${_line}" ;;
+    esac
+  done < <(BX_RECIPE="$_name" BX_RECIPE_DIR="$_book" "$_exe") || \
+    _die "[${_name}] resolver ${_resolve} failed"
+  return 0
+}
+
+# Walk the extends chain, base last, copying inherited keys under the recipe's
+# own. A cycle is an error. The leaf's resolver runs last, so its values win.
+_resolve_extended() {
+  local _name="$1" _cur _seen="" _base _k _baseval _curval _resv
+  _cur="$_name"
+  while [[ -n "$_cur" ]]; do
+    case "
+${_seen}" in *"
+${_cur}
+"*) _die "recipe '${_name}' extends in a cycle at '${_cur}'" ;; esac
+    _seen="${_seen}${_cur}
+"
+    _base=""
+    eval "_base=\${_cfg_${_cur}_extends:-}"
+    if [[ -n "$_base" ]]; then
+      _has_recipe "$_base" || _die "[${_cur}] extends unknown recipe '${_base}'"
+      for _k in $_recipe_keys; do
+        eval "_baseval=\${_cfg_${_base}_${_k}:-}"
+        [[ -n "$_baseval" ]] || continue
+        if _is_multi_key "$_k"; then
+          eval "_curval=\${_cfg_${_cur}_${_k}:-}"
+          if [[ -n "$_curval" ]]; then
+            _store_scalar "$_cur" "$_k" "${_baseval}
+${_curval}"
+          else
+            _store_scalar "$_cur" "$_k" "$_baseval"
+          fi
+        else
+          eval "_curval=\${_cfg_${_cur}_${_k}:-}"
+          [[ -n "$_curval" ]] || _store_scalar "$_cur" "$_k" "$_baseval"
+        fi
+      done
+      _provenance "${_cur}.extends" "extends:${_base}"
+    fi
+    _cur="$_base"
+  done
+  eval "_resv=\${_cfg_${_name}_resolve:-}"
+  [[ -n "$_resv" ]] && _run_resolver "$_name" "$_resv"
+  return 0
+}
+
+# Merge `_cfg_<name>_*` into BX_* variables, after inheriting from any base
+# recipe and running the resolver. A recipe is self-contained data plus, at
+# most, one referenced resolver.
+#
+# A command recipe may name a machine (`machine = libc-dev`) and override any of
+# that machine's shape keys. The machine is resolved first, then the command's
+# own explicitly-set shape keys are overlaid. `--machine` on the command line
+# (BX_MACHINE) replaces the whole shape: the named machine is used verbatim and
+# the command recipe's machine reference and shape keys are ignored, while its
+# command and lifecycle flags survive. `--name` likewise beats a recipe's
+# `name`, because the command line is the more specific intent.
+_resolve_recipe() {
+  local _name="$1" _key _val
+  _params=""
+  _resolve_extended "$_name"
+
+  local _ovr_machine="${BX_MACHINE:-}" _inline_machine=""
+  eval "_inline_machine=\${_cfg_${_name}_machine:-}"
+  [[ -n "$_ovr_machine" ]] && _inline_machine="$_ovr_machine"
+
+  # A machine name that is also the recipe's own name is a mistake, not a
+  # self-reference: it would borrow the command recipe's shape as if it were a
+  # machine.
+  if [[ -n "$_inline_machine" ]]; then
+    if [[ "$_inline_machine" == "$_name" ]]; then
+      _die "[${_name}] machine = ${_name} refers to itself; name the machine recipe something else"
+    fi
+    _has_recipe "$_inline_machine" || \
+      _die "[${_name}] machine '${_inline_machine}' is not defined"
+    _resolve_extended "$_inline_machine"
+    for _key in $_shape_keys; do
+      eval "_val=\${_cfg_${_inline_machine}_${_key}:-}"
+      [[ -n "$_val" ]] || continue
+      _provenance "${_name}.${_key}" "machine:${_inline_machine}"
+      _apply_recipe_key "$_key" "$_val"
     done
+  fi
+
+  for _key in $_recipe_keys; do
+    case "$_key" in extends|resolve|machine) continue ;; esac
+    eval "_val=\${_cfg_${_name}_${_key}:-}"
+    [[ -n "$_val" ]] || continue
+    # With --machine, the command's shape keys are discarded: the named
+    # machine owns the shape, and the command only contributes behavior.
+    if [[ -n "$_ovr_machine" ]] && _is_shape_key "$_key"; then
+      _provenance "${_name}.${_key}" "ignored:--machine"
+      continue
+    fi
+    # --name on the command line wins over a recipe's `name`.
+    if [[ "$_key" == name && -n "${_name_overridden:-}" ]]; then
+      _provenance "${_name}.${_key}" "ignored:--name"
+      continue
+    fi
+    _provenance "${_name}.${_key}" "recipe"
+    _apply_recipe_key "$_key" "$_val"
   done
 }
 
-# Merge `_cfg_<name>_*` into BX_* variables. Scalar keys: a later source has
-# already overwritten the variable, so it is the winner. Multi keys: the value
-# accumulated in read order.
-_resolve_recipe() {
-  local _name="$1" _key _val
-  # The built-in pi recipe is the profile that ships with bx. A `profile =` key
-  # delegates the whole run to a host-side launcher (which owns its own
-  # machine), so bx must not also create one. A user's own [pi] section, or a
-  # pi.conf, is loaded first and wins over this default.
-  if [[ "$_name" == "pi" ]]; then
-    BX_PROFILE="${BX_PROFILE:-bx-pi}"
-  fi
-  for _key in $_recipe_keys; do
-    eval "_val=\${_cfg_${_name}_${_key}:-}"
-    [[ -n "$_val" ]] || continue
-    case "$_key" in
-      command)       BX_COMMAND="$_val" ;;
-      image)         BX_IMAGE="$_val" ;;
-      name)          BX_NAME="$_val" ;;
-      cpus)          BX_CPUS="$_val" ;;
-      mem)           BX_MEM="$_val" ;;
-      net)           BX_NET="$_val" ;;
-      mounts)        BX_MOUNTS="$_val" ;;
-      workdir)       BX_WORKDIR="$_val" ;;
-      keep)          BX_KEEP="$_val" ;;
-      reset)         BX_RESET="$_val" ;;
-      bootstrap)     BX_BOOTSTRAP="$_val" ;;
-      bootstrap_env) BX_BOOTSTRAP_ENV="$_val" ;;
-      secret_env)    BX_SECRET_ENV="$_val" ;;
-      pre_command)   BX_PRE_COMMAND="$_val" ;;
-      state_dir)     BX_STATE_DIR="$_val" ;;
-      profile)       BX_PROFILE="$_val" ;;
-    esac
-  done
+# Assign one resolved key into its BX_* variable. Kept separate so the machine
+# overlay and the recipe merge share one mapping, and a new key cannot be added
+# in one place and forgotten in the other.
+_apply_recipe_key() { # key value
+  local _key="$1" _val="$2"
+  case "$_key" in
+    command)       BX_COMMAND="$_val" ;;
+    image)         BX_IMAGE="$_val" ;;
+    name)          BX_NAME="$_val" ;;
+    cpus)          BX_CPUS="$_val" ;;
+    mem)           BX_MEM="$_val" ;;
+    net)           BX_NET="$_val" ;;
+    mounts)        BX_MOUNTS="$_val" ;;
+    workdir)       BX_WORKDIR="$_val" ;;
+    keep)          BX_KEEP="$_val" ;;
+    reset)         BX_RESET="$_val" ;;
+    bootstrap)     BX_BOOTSTRAP="$_val" ;;
+    bootstrap_env) BX_BOOTSTRAP_ENV="$_val" ;;
+    secret_env)    BX_SECRET_ENV="$_val" ;;
+    pre_command)   BX_PRE_COMMAND="$_val" ;;
+    state_dir)     BX_STATE_DIR="$_val" ;;
+    profile)       BX_PROFILE="$_val" ;;
+  esac
 }
 
 _dump_recipe() {
@@ -216,15 +489,61 @@ _dump_recipe() {
   [[ -n "${BX_BOOTSTRAP_ENV:-}" ]] && printf 'bootstrap_env=\n%s\n' "$BX_BOOTSTRAP_ENV"
   [[ -n "${BX_SECRET_ENV:-}" ]] && printf 'secret_env=\n%s\n' "$BX_SECRET_ENV"
   [[ -n "${BX_PRE_COMMAND:-}" ]] && printf 'pre_command=%s\n' "$BX_PRE_COMMAND"
+  # The bootstrap is often long; show that it is set and how big, not the
+  # whole body, so `--show` stays readable. `--dry-run` prints it in full.
+  if [[ -n "${BX_BOOTSTRAP:-}" ]]; then
+    printf 'bootstrap=<%s lines>\n' "$(printf '%s' "$BX_BOOTSTRAP" | wc -l | tr -d ' ')"
+  fi
+  # Provenance, last and labelled, so a value can always be traced to its
+  # source. Values themselves are not repeated here.
+  if [[ -n "$_prov" ]]; then
+    printf '\nsources=\n'
+    printf '%s' "$_prov" | sort | sed 's/^/  /'
+  fi
+  return 0
+}
+
+# Write a starter recipe into ~/.bx/recipes, so a user's first recipe is one
+# command. Never overwrites an existing file.
+_scaffold_recipe() {
+  local _name="$1" _dir="${HOME:-}/.bx/recipes" _file
+  [[ "$_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || \
+    _die "recipe name '$_name' is invalid; use letters, digits, or '_' (must not start with a digit)"
+  mkdir -p "$_dir" || _die "could not create $_dir"
+  _file="${_dir}/${_name}.conf"
+  [[ -e "$_file" ]] && _die "$_file already exists"
+  cat >"$_file" <<EOF
+# ${_name} — a bx recipe. Run it with: bx ${_name}
+#
+# This is a command recipe with a shape of its own. To share a shape with
+# other recipes, put it in ~/.bx/machines/<name>.conf and replace the shape
+# keys below with a single line:
+#
+#   machine = <name>
+#
+# A command recipe may still override any shape key after `machine =`.
+#
+# The format is documented in the shipped book: share/bx/recipes/README.md.
+
+[${_name}]
+image    = debian:bookworm-slim
+cpus     = 4
+mem      = 4096
+mounts   = \$PWD:/work
+workdir  = /work
+command  = echo hello from \$PWD
+EOF
+  _note "wrote $_file"
+  _note "run it with: bx ${_name}"
   return 0
 }
 
 # ── arguments ───────────────────────────────────────────────────────────────
-# A bare word is a recipe name; flags are handled first so a recipe can never
-# be shadowed by an option. Everything after the recipe is forwarded to it.
 _recipe=""
 _show=""
+_new_recipe=""
 BX_PROFILE=""
+_name_overridden=""
 _passthrough=()
 # Flags bx consumed for itself, kept so they can be replayed to a profile
 # recipe, which owns its own machine and therefore wants --reset/--keep too.
@@ -234,16 +553,21 @@ while [[ $# -gt 0 ]]; do
     --dry-run) BX_DRY_RUN=1; _own_flags+=(--dry-run); shift ;;
     --reset)   BX_RESET=1; _own_flags+=(--reset); shift ;;
     --keep)    BX_KEEP=1; _own_flags+=(--keep); shift ;;
-    --name)    [[ $# -ge 2 ]] || _die "--name needs a value"; BX_NAME="$2"; shift 2 ;;
-    --name=*)  BX_NAME="${1#*=}"; shift ;;
+    --name)    [[ $# -ge 2 ]] || _die "--name needs a value"; BX_NAME="$2"; _name_overridden=1; shift 2 ;;
+    --name=*)  BX_NAME="${1#*=}"; _name_overridden=1; shift ;;
+    --machine) [[ $# -ge 2 ]] || _die "--machine needs a value"; BX_MACHINE="$2"; shift 2 ;;
+    --machine=*) BX_MACHINE="${1#*=}"; shift ;;
     --list)    _load_sources; _recipe_list; exit 0 ;;
+    --new)     [[ $# -ge 2 ]] || _die "--new needs a recipe name"; _new_recipe="$2"; shift 2 ;;
+    --new=*)   _new_recipe="${1#*=}"; shift ;;
     --show)    [[ $# -ge 2 ]] || _die "--show needs a recipe name"; _show="$2"; shift 2 ;;
     --show=*)  _show="${1#*=}"; shift ;;
     -h|--help) _usage; exit 0 ;;
     --)        shift; _passthrough+=("$@"); break ;;
     -*)
       # Before a recipe is named, an unknown option is a mistake. After one, it
-      # belongs to the recipe: `bx pi --reset -p hi` forwards both to bx-pi.
+      # belongs to the recipe: `bx pi --reset -p hi` forwards both to the
+      # recipe's command.
       if [[ -n "$_recipe" ]]; then _passthrough+=("$1"); shift
       else _die "unknown option: $1 (see --help)"; fi ;;
     *)
@@ -251,6 +575,11 @@ while [[ $# -gt 0 ]]; do
       else _passthrough+=("$1"); shift; fi ;;
   esac
 done
+
+if [[ -n "$_new_recipe" ]]; then
+  _scaffold_recipe "$_new_recipe"
+  exit 0
+fi
 
 if [[ -n "$_show" || -n "$_recipe" ]]; then
   _load_sources
@@ -274,10 +603,10 @@ if [[ ${#_passthrough[@]} -gt 0 ]]; then
 fi
 
 # A recipe may name a host-side profile instead of describing a guest command.
-# The profile owns its own machine (bx-pi does), so bx hands off rather than
-# starting one of its own: this is what makes `bx pi` mean "run the pi
-# profile" without nesting a VM inside a VM. Arguments pass through untouched,
-# and `--dry-run` is the profile's to interpret (bx-pi has its own plan).
+# The profile owns its own machine, so bx hands off rather than starting one of
+# its own: this is what makes a profile recipe mean "run that program" without
+# nesting a VM inside a VM. Arguments pass through untouched, and `--dry-run`
+# is the profile's to interpret (it has its own plan).
 if [[ -n "$BX_PROFILE" ]]; then
   command -v "$BX_PROFILE" >/dev/null 2>&1 || \
     _die "profile '$BX_PROFILE' is not on PATH"
@@ -300,7 +629,12 @@ _command="${BX_COMMAND:-}"
 _dry_run="${BX_DRY_RUN:-0}"
 _no_lock="${BX_NO_LOCK:-0}"
 
-[[ -n "$_command" ]] || _die "no command: name a recipe (bx <recipe>) or set BX_COMMAND"
+if [[ -z "$_command" ]]; then
+  if [[ -n "${_recipe:-}" ]] && _has_recipe "$_recipe"; then
+    _die "'${_recipe}' is a machine recipe (no command); run a command recipe with 'machine = ${_recipe}', or pass a command after it"
+  fi
+  _die "no command: name a recipe (bx <recipe>) or set BX_COMMAND"
+fi
 [[ "$_vm_name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || \
   _die "machine name '$_vm_name' is invalid; use letters, digits, '_' or '-'"
 
