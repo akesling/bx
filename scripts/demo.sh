@@ -5,7 +5,7 @@
 # links to: a viewer watches the wall appear, rather than reading a claim that
 # it exists.
 #
-# Record it on a KVM host with a real smolvm:
+# Record it on a host with a real smolvm — macOS, or Linux with /dev/kvm:
 #
 #   asciinema rec --cols 80 --rows 24 demo.cast -c 'scripts/demo.sh'
 #
@@ -62,7 +62,10 @@ _guest_exec() {
   smolvm machine exec "${BX_NAME:-demo}" -- sh -c "$1" 2>/dev/null
 }
 
-_real_smolvm() { command -v smolvm >/dev/null 2>&1 && [[ -e /dev/kvm ]]; }
+# The boot predicate lives in scripts/lib.sh so the test suite exercises the
+# same code this demo gates on. See that file for why it is not a bare
+# /dev/kvm check (which would wrongly skip macOS).
+. "${_here}/lib.sh"
 
 # ── the recording ───────────────────────────────────────────────────────────
 clear
@@ -84,13 +87,13 @@ _export_bx --name demo --reset --keep >/dev/null 2>&1
 _started=$?
 
 if [[ $_started -ne 0 ]]; then
-  _no "could not start a machine here (no smolvm/KVM)"
-  _note "this recording must be made on a KVM host with smolvm installed"
+  _no "could not start a machine here (no smolvm/hypervisor)"
+  _note "this recording must be made on a host with smolvm and hardware virtualization"
   exit 1
 fi
 _ok "machine up: only /work is visible"
 
-if ! _real_smolvm; then
+if ! _smolvm_can_boot; then
   _no "cannot verify the fence without a real smolvm"
   exit 1
 fi

@@ -1,11 +1,12 @@
 # Launch runbook
 
 Everything here is one command, and every command refuses to lie: the demo
-exits non-zero without a real KVM/smolvm, and the benchmark prints `n/a`
-rather than a number it did not measure. Run this on a Linux host with
-`smolvm` on `PATH` and `/dev/kvm` present.
+exits non-zero without a real smolvm, and the benchmark prints `n/a`
+rather than a number it did not measure. Run this on a host with
+`smolvm` on `PATH` and hardware virtualization available — macOS on Apple
+silicon via Hypervisor.framework, or Linux with `/dev/kvm`.
 
-## 0. Sanity (no KVM needed)
+## 0. Sanity (no VM needed)
 
 ```sh
 sh scripts/check.sh          # shellcheck (if present) + the full test suite
@@ -64,7 +65,7 @@ Answer these in the post, not the thread:
 | "Just use `docker run`" | Essay: shape is bound at create time; lifecycle is unowned |
 | "Why not microsandbox / e2b / daytona?" | README "Related work" (name what each does better) |
 | "This is an ad for Subconscious" | README "What this doesn't do"; the demo needs no account |
-| "Linux-only?" | State it up front as a named limit |
+| "Why not just run containers on the Mac?" | README "Containers inside the guest" — you can, and here is the caveat |
 | "How slow?" | The benchmark table, with its hardware caveat |
 
 ## 5. The checklist

@@ -5,8 +5,9 @@
 #
 #   scripts/bench.sh --fake     # runs against a fake smolvm; emits NO numbers.
 #                               # Proves the harness works. Safe for CI.
-#   scripts/bench.sh --real     # runs against a real smolvm + KVM. Emits the
-#                               # table. Requires smolvm on PATH and /dev/kvm.
+#   scripts/bench.sh --real     # runs against a real smolvm. Emits the
+#                               # table. Requires smolvm on PATH and a host
+#                               # that can boot a VM (macOS, or Linux + /dev/kvm).
 #
 # Design rule: this script never invents a number. If a measurement fails,
 # times out, or runs in --fake mode, the corresponding cell is `n/a` and a
@@ -42,13 +43,21 @@ esac
 _note() { printf 'bench: %s\n' "$*" >&2; }
 _warn() { printf 'bench: WARNING: %s\n' "$*" >&2; }
 
+# A host can boot a smolvm machine if smolvm is present and the platform has
+# hardware virtualization: macOS (Hypervisor.framework) or Linux with /dev/kvm.
+# Checking /dev/kvm alone wrongly excludes the Mac, which is a first-class host.
+# The predicate lives in scripts/lib.sh so the test suite exercises this exact
+# code rather than a copy of it.
+. "${_here}/lib.sh"
+
 # ── preconditions ───────────────────────────────────────────────────────────
 if [[ "$_mode" == real ]]; then
-  if ! command -v smolvm >/dev/null 2>&1; then
-    _warn "smolvm is not on PATH; cannot measure. Falling back to --fake (no numbers)."
-    _mode=fake
-  elif [[ ! -e /dev/kvm ]]; then
-    _warn "no /dev/kvm; cannot boot a VM. Falling back to --fake (no numbers)."
+  if ! _smolvm_can_boot; then
+    if ! command -v smolvm >/dev/null 2>&1; then
+      _warn "smolvm is not on PATH; cannot measure. Falling back to --fake (no numbers)."
+    else
+      _warn "host cannot boot a VM (no /dev/kvm); falling back to --fake (no numbers)."
+    fi
     _mode=fake
   fi
 fi
@@ -172,5 +181,5 @@ TABLE
 if [[ "$_mode" != fake ]]; then
   _note "measured with real smolvm on this host"
 else
-  _note "no numbers emitted; run with --real on a KVM host to fill the table"
+  _note "no numbers emitted; run with --real on a host that can boot a VM to fill the table"
 fi

@@ -18,7 +18,8 @@ that seriously. See [Why this instead of Docker](#why-this-instead-of-docker-or-
 <!-- Record with: asciinema rec --cols 80 --rows 24 demo.cast -c 'scripts/demo.sh'.
      Replace this block once the cast exists; see docs/launch.md. -->
 > **See it work:** `scripts/demo.sh` drives the guest to read a host secret (it
-> cannot) and then edit the project (it can). Record it on a KVM host with
+> cannot) and then edit the project (it can). Record it on any host with `smolvm`
+> on `PATH` — macOS via Hypervisor.framework, or Linux with `/dev/kvm` — with
 > `asciinema rec --cols 80 --rows 24 demo.cast -c 'scripts/demo.sh'`, then embed
 > the cast here.
 
@@ -55,8 +56,9 @@ cd ~/src/bx
 `PREFIX` chooses another prefix, `DESTDIR` stages a package root, and
 `./install.sh --uninstall` removes exactly what a previous install wrote.
 
-Requires `smolvm` on `PATH` and a Linux host with virtualization available.
-`bx` itself needs nothing else — no account, no config, no network.
+Requires `smolvm` on `PATH` on a host with hardware virtualization — macOS on
+Apple silicon (Hypervisor.framework) or Linux with `/dev/kvm`. `bx` itself needs
+nothing else — no account, no config, no network.
 
 ### If you want the bundled agent
 
@@ -146,15 +148,66 @@ isolation itself.
 
 ### What this doesn't do
 
-- Linux hosts only; it needs KVM and `smolvm` on `PATH`.
 - One machine per project directory, not one shared across all of them.
-- No Windows or macOS guest/host story yet.
+- No Windows host story yet.
 - The generic `bx` core needs no account. The shipped `bx pi` recipe needs a
   Subconscious login or API key, because that's the provider the agent talks
   to. The `sandbox` recipe and anything you write need neither.
 
 `bx` is a ~500-line shell script, deliberately. There's no daemon, no control
 plane, and no state you can't read with `ls`.
+
+## Hosts
+
+`bx` runs wherever `smolvm` does. As of today that is:
+
+- **macOS** on Apple silicon, via Hypervisor.framework. This is the primary
+target — the shipped `pi` recipe is developed on a Mac.
+- **Linux**, via KVM (`/dev/kvm` must exist).
+
+The VMM is smolvm's business, not `bx`'s. `bx` only needs `smolvm` on `PATH` and
+a host where it can boot a machine. The capability probe used by the test and
+benchmark harnesses is therefore "`smolvm` is on `PATH`, and this is either
+macOS or a Linux host with `/dev/kvm`" — not a `/dev/kvm` check, which would
+wrongly skip the Mac.
+
+### Containers inside the guest
+
+You can run ordinary Linux containers *inside* a bx machine. The guest is a
+full Linux environment with a container-capable kernel (namespaces, cgroup v2,
+overlayfs, fuse), and the agent can install and use a runtime exactly as it
+would on a server:
+
+```sh
+bx bash
+# in the guest
+apt-get install -y podman
+podman run -d --name pg -e POSTGRES_PASSWORD=secret -p 5432:5432 \
+  docker.io/library/postgres:16
+podman exec pg psql -U postgres -c 'SELECT version()'
+```
+
+One caveat, because the guest rootfs is itself an overlayfs: podman's default
+`overlay` storage driver refuses to start over overlayfs. Use `vfs` (full-copy,
+no copy-on-write — slower and disk-hungry but correct), or install
+`fuse-overlayfs` for copy-on-write. Either way, set it in
+`/etc/containers/storage.conf`:
+
+```toml
+[storage]
+driver = "vfs"
+```
+
+**This is a capability, and it is worth understanding before leaning on it.**
+Running containers inside the guest widens what code inside the fence can do:
+the nested containers run as root with the guest's capability set.
+`SMOLVM_DOCKER_SOCKET` can publish `/var/run/docker.sock` across the boundary,
+which is a host-reaching bridge by design. And a nested container is a second
+long-lived, mutable thing inside the machine — with its own shape, its own
+locks, and its own reclamation problem. `bx` does **not** manage that lifecycle
+today; it manages the *machine's*. Treat containers-in-guest as something the
+agent does inside the sandbox, not as a second thing `bx` reconciles.
+
 
 ## Costs
 
