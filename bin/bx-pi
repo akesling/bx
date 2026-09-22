@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+# bx-pi — run the pi coding agent inside a smolvm microVM.
+#
+# This is the pi profile for bx. It owns everything pi- and
+# Subconscious-specific: resolving the gateway, key, model, and token limits;
+# bootstrapping bun + pi into the guest; writing the guest's pi config; and
+# the command line that launches pi. The machine lifecycle lives in bx, which
+# this script drives.
+#
+# Usage:
+#   bx-pi                     # pi in the guest, mounted at the current dir
+#   bx-pi -p "fix the tests"  # extra arguments are forwarded to pi
+#   bx-pi --model subconscious/glm-5.2 -p "hi"
+#   bx-pi --dry-run           # show what it resolved, touch nothing
+#   bx-pi --reset             # recreate the machine
+#   bx-pi --keep              # leave the machine running when pi exits
+#
+# Everything that is not an option to this script is forwarded to pi. Secret
+# values are never printed and never appear in argv: they cross into the guest
+# through smolvm's `--secret-env`, which resolves host variables by name.
+#
+# Script options:
+#   --profile NAME   Subconscious profile to use (default: active/default)
+#   --model MODEL    Override the profile's model for this launch
+#   --dir PATH       Host directory to mount and run in (default: $PWD)
+#   --dry-run        Print the resolved configuration and exit
+#   --reset          Recreate the machine before starting
+#   --keep           Leave the machine running after pi exits
+#
+# Inputs read from outside this script (upper case because they cross the
+# boundary). Each falls back to the Subconscious profile, so none is required:
+#   BX_PI_IMAGE      guest image             (default debian:bookworm-slim)
+#   BX_PI_NAME       machine name            (default pi-<dir name>)
+#   BX_PI_CPUS       vCPUs                   (default 4)
+#   BX_PI_MEM        memory MiB              (default 4096)
+#   BX_PI_MOUNT      HOST:GUEST mount        (default <dir>:/work)
+#   BX_PI_WORKDIR    guest working directory (default /work)
+#   BX_PI_MOUNTS     extra newline-separated HOST:GUEST mounts
+#   BX_PI_RESET      "1" to reset on start
+#   BX_PI_KEEP       "1" to leave the VM running after pi exits
+#   SUBC_CONFIG_DIR  Subconscious config dir (default ~/.subconscious)
+#   SUBCONSCIOUS_BASE_URL, SUBCONSCIOUS_MODEL, SUBCONSCIOUS_API_KEY
+#
+# Inside this script every variable is _lower_case; the upper-case ones above
+# are boundary values only.
+
+set -euo pipefail
+
+_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+_die() { printf 'bx-pi: %s\n' "$*" >&2; exit 1; }
+_note() { printf 'bx-pi: %s\n' "$*" >&2; }
+
+# Locate the bx runner: a sibling first (running from a checkout), then PATH
+# (running once installed).
+_bx=""
+if [[ -x "${_script_dir}/bx" ]]; then
+  _bx="${_script_dir}/bx"
+elif command -v bx >/dev/null 2>&1; then
+  _bx="$(command -v bx)"
+else
+  _die "bx is not on PATH and not beside $0; install bx first"
+fi
+
+# ── arguments ───────────────────────────────────────────────────────────────
+_profile="${BX_PI_PROFILE:-}"
+_model_override=""
+_dry_run=0
+_reset="${BX_PI_RESET:-0}"
+_keep="${BX_PI_KEEP:-0}"
+_mount_dir="${BX_PI_DIR:-$PWD}"
+_pi_args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --)
+      shift; _pi_args+=("$@"); break ;;
+    --profile)
+      [[ $# -ge 2 ]] || _die "--profile needs a value"
+      _profile="$2"; shift 2 ;;
+    --profile=*)
+      _profile="${1#*=}"; shift ;;
+    --model)
+      [[ $# -ge 2 ]] || _die "--model needs a value"
+      _model_override="$2"; shift 2 ;;
+    --model=*)
+      _model_override="${1#*=}"; shift ;;
+    --dir)
+      [[ $# -ge 2 ]] || _die "--dir needs a value"
+      _mount_dir="$2"; shift 2 ;;
+    --dir=*)
+      _mount_dir="${1#*=}"; shift ;;
+    --dry-run)
+      _dry_run=1; shift ;;
+    --reset)
+      _reset=1; shift ;;
+    --keep)
+      _keep=1; shift ;;
+    -h|--help)
+      sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)
+      _pi_args+=("$1"); shift ;;
+  esac
+done
+
+[[ -d "$_mount_dir" ]] || _die "--dir $_mount_dir is not a directory"
+_mount_dir="$(cd "$_mount_dir" && pwd)"
+
+# ── gateway configuration, derived not exported ─────────────────────────────
+# Mirrors the Subconscious launcher's resolution:
+#   baseUrl  SUBCONSCIOUS_BASE_URL          -> profile GATEWAY_URL -> default
+#   model    --model / SUBCONSCIOUS_MODEL    -> profile MODEL       -> default
+#   key      SUBCONSCIOUS_API_KEY            -> profile key         -> config.json
+_config_dir="${SUBC_CONFIG_DIR:-$HOME/.subconscious}"
+[[ -d "$_config_dir" ]] || _config_dir="$HOME/.subconscious"
+_config_json="${_config_dir}/config.json"
+
+# The active profile, unless one was chosen explicitly.
+if [[ -z "$_profile" ]]; then
+  if [[ -f "$_config_json" ]]; then
+    _profile="$(sed -n 's/^"active_profile"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+      "$_config_json" | head -1)"
+  fi
+fi
+if [[ -n "$_profile" && "$_profile" != "default" ]]; then
+  _profile_file="${_config_dir}/profiles/${_profile}.env"
+else
+  _profile_file="${_config_dir}/profiles/default.env"
+  _profile="default"
+fi
+
+# Read one KEY=value out of a .env-style profile without executing it.
+_profile_value() {
+  [[ -f "$_profile_file" ]] || return 0
+  sed -n "s/^$1=//p" "$_profile_file" | tail -1
+}
+
+# `defaults` from registry.generated.json of the installed subconscious-cli.
+_registry_default() {
+  local _key="$1" _file _value
+  for _file in "${SUBCONSCIOUS_RUNBOOK_DIR:-}/registry.generated.json" \
+               "$HOME"/.bun/install/cache/subconscious-cli@*/bin/registry.generated.json \
+               "$HOME"/.bun/install/global/node_modules/subconscious-cli/bin/registry.generated.json; do
+    [[ -f "$_file" ]] || continue
+    _value="$(python3 - "$_file" "$_key" <<'PY' 2>/dev/null
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("defaults", {}).get(sys.argv[2], ""))
+except Exception:
+    pass
+PY
+)"
+    [[ -n "$_value" ]] && { printf '%s' "$_value"; return 0; }
+  done
+}
+
+_profile_gateway="$(_profile_value GATEWAY_URL)"
+_profile_model="$(_profile_value MODEL)"
+_profile_key="$(_profile_value PI_API_KEY)"
+[[ -n "$_profile_key" ]] || _profile_key="$(_profile_value API_KEY)"
+
+GATEWAY_URL="${SUBCONSCIOUS_BASE_URL:-${GATEWAY_URL:-${_profile_gateway:-}}}"
+# `subc` exports a bare MODEL into every launch, so it must not outrank the
+# profile file: the profile is the user's configured choice, the ambient
+# variable is whatever the last launcher happened to set.
+MODEL="${_model_override:-${SUBCONSCIOUS_MODEL:-${_profile_model:-${MODEL:-}}}}"
+[[ -n "$GATEWAY_URL" ]] || GATEWAY_URL="$(_registry_default baseUrl)"
+[[ -n "$GATEWAY_URL" ]] || GATEWAY_URL="https://api.subconscious.dev"
+# The script's own default wins over the CLI registry's default model, so a
+# fresh machine starts on the model this script names.
+[[ -n "$MODEL" ]] || MODEL="subconscious/deepseek-v4.1-flash-marathon"
+
+API_KEY="${PI_API_KEY:-${API_KEY:-${_profile_key:-${SUBCONSCIOUS_API_KEY:-}}}}"
+if [[ -z "$API_KEY" && -f "$_config_json" ]]; then
+  API_KEY="$(python3 - "$_config_json" <<'PY' 2>/dev/null
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("subconscious_api_key", ""))
+except Exception:
+    pass
+PY
+)"
+fi
+[[ -n "$API_KEY" ]] || _die "no Subconscious key found; run \`subc login\` or set SUBCONSCIOUS_API_KEY"
+
+# Token limits are optional; keep the profile's if it has them.
+PI_CONTEXT_WINDOW="${PI_CONTEXT_WINDOW:-$(_profile_value PI_CONTEXT_WINDOW)}"
+PI_MAX_TOKENS="${PI_MAX_TOKENS:-$(_profile_value PI_MAX_TOKENS)}"
+PI_CONTEXT_WINDOW="${PI_CONTEXT_WINDOW:-5000000}"
+PI_MAX_TOKENS="${PI_MAX_TOKENS:-65536}"
+
+# The compaction extension is observational and optional. Resolve the runbook
+# from the installed CLI rather than pinning a version.
+if [[ -z "${SUBCONSCIOUS_RUNBOOK_DIR:-}" ]]; then
+  for _candidate in "$HOME"/.bun/install/cache/subconscious-cli@*/bin/runbook \
+                    "$HOME"/.bun/install/global/node_modules/subconscious-cli/bin/runbook; do
+    [[ -d "$_candidate" ]] && { SUBCONSCIOUS_RUNBOOK_DIR="$_candidate"; break; }
+  done
+fi
+_extension_src="${SUBCONSCIOUS_RUNBOOK_DIR:-}/pi/subconscious-compaction.ts"
+[[ -f "$_extension_src" ]] || _extension_src=""
+
+_note "profile=$_profile gateway=$GATEWAY_URL model=$MODEL dir=$_mount_dir"
+
+if [[ "$_dry_run" == "1" ]]; then
+  printf 'config_dir=%s\nprofile=%s\ngateway=%s\nmodel=%s\nkey_length=%s\ncontext_window=%s\nmax_tokens=%s\nextension=%s\ndir=%s\n' \
+    "$_config_dir" "$_profile" "$GATEWAY_URL" "$MODEL" "${#API_KEY}" \
+    "$PI_CONTEXT_WINDOW" "$PI_MAX_TOKENS" "${_extension_src:-none}" "$_mount_dir"
+fi
+
+# ── guest bootstrap (idempotent) ────────────────────────────────────────────
+# Installs bun + pi once into the persistent overlay, then rewrites the
+# Subconscious provider on every run so a rotated key or changed model is
+# picked up. The provider document mirrors runbook/pi/install.sh.
+read -r -d '' _bootstrap <<'BOOTSTRAP' || true
+set -euo pipefail
+
+if ! command -v curl >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -q
+  apt-get install -yq --no-install-recommends curl ca-certificates git unzip python3
+fi
+
+export PATH="/root/.bun/bin:/usr/local/bin:$PATH"
+
+if ! command -v bun >/dev/null 2>&1; then
+  # The bun installer fetches a GitHub release; a transient 5xx should not
+  # abort the whole launch, so retry a few times before giving up.
+  for _attempt in 1 2 3; do
+    if curl -fsSL https://bun.sh/install | bash; then break; fi
+    printf 'bx-pi: bun install attempt %s failed; retrying\n' "$_attempt" >&2
+    sleep 3
+  done
+  export PATH="/root/.bun/bin:$PATH"
+  command -v bun >/dev/null 2>&1 || { echo 'bx-pi: could not install bun' >&2; exit 1; }
+fi
+
+# pi's entrypoints use a `#!/usr/bin/env node` shebang; bun is the runtime, so
+# provide a node shim or pi resolves but exits with "env: 'node': No such file".
+if ! command -v node >/dev/null 2>&1; then
+  ln -sf "$(command -v bun)" /usr/local/bin/node
+fi
+
+if ! command -v pi >/dev/null 2>&1; then
+  bun install -g @earendil-works/pi-coding-agent
+fi
+
+# Keep the agent config inside the mounted workdir so a fresh container is
+# self-describing and the config survives the ephemeral root home. An explicit
+# PI_CODING_AGENT_DIR still wins. The guest always sees the mount at /work.
+PI_DIR="${PI_CODING_AGENT_DIR:-/work/.pi/agent}"
+mkdir -p "$PI_DIR/extensions"
+export PI_CODING_AGENT_DIR="$PI_DIR"
+
+python3 - "$MODEL" "$GATEWAY_URL" "$API_KEY" "$PI_CONTEXT_WINDOW" "$PI_MAX_TOKENS" "$PI_DIR/models.json" <<'PY'
+import json, os, sys
+model, gateway, api_key, ctx, maxtok, path = sys.argv[1:7]
+doc = {
+    "providers": {
+        "subconscious": {
+            "baseUrl": gateway.rstrip("/") + "/v1",
+            "api": "openai-completions",
+            "apiKey": api_key,
+            "headers": {"x-subconscious-client": "pi"},
+            "models": [{
+                "id": model,
+                "contextWindow": int(ctx),
+                "maxTokens": int(maxtok),
+                "compat": {
+                    "sendSessionAffinityHeaders": True,
+                    "sessionAffinityFormat": "openai-nosession",
+                },
+            }],
+        }
+    }
+}
+with open(path, "w") as fh:
+    json.dump(doc, fh, indent=2)
+os.chmod(path, 0o600)
+
+# Record the startup model so a fresh guest resolves the same model every
+# launch, instead of falling back to whichever model pi guesses first.
+settings_path = os.path.join(os.path.dirname(path), "settings.json")
+try:
+    with open(settings_path) as fh:
+        settings = json.load(fh)
+except (OSError, ValueError):
+    settings = {}
+settings["defaultModel"] = model
+with open(settings_path, "w") as fh:
+    json.dump(settings, fh, indent=2)
+PY
+
+if [[ -n "${EXTENSION_PATH:-}" && -f "$EXTENSION_PATH" ]]; then
+  cp "$EXTENSION_PATH" "$PI_DIR/extensions/subconscious-compaction.ts"
+fi
+
+printf 'bx-pi: bun %s / pi %s\n' "$(bun --version)" "$(pi --version 2>/dev/null || echo unknown)"
+BOOTSTRAP
+
+
+# ── launch command ──────────────────────────────────────────────────────────
+# The guest sees the mounted working directory; the agent config lives inside
+# it, so recompute the path rather than relying on the bootstrap's PI_DIR.
+_workdir="${BX_PI_WORKDIR:-/work}"
+_agent_dir="${_workdir}/.pi/agent"
+_run_pi="export PATH=\"/root/.bun/bin:/usr/local/bin:\$PATH\"; export PI_CODING_AGENT_DIR=\"${_agent_dir}\"; exec pi --provider subconscious --model \"\$MODEL\""
+# Bash 3.2 (macOS's /bin/bash) treats "${_pi_args[@]}" as an unbound
+# variable under `set -u` when the array is empty, so guard the expansion.
+for _arg in ${_pi_args[@]+"${_pi_args[@]}"}; do
+  printf -v _quoted '%q' "$_arg"
+  _run_pi+=" ${_quoted}"
+done
+
+# ── hand off to the generic runner ──────────────────────────────────────────
+# The bootstrap and the launch both need the resolved values, which cross as
+# secrets so they stay out of argv and out of this script's output.
+export _BX_PI_GATEWAY_URL="$GATEWAY_URL"
+export _BX_PI_API_KEY="$API_KEY"
+export _BX_PI_MODEL="$MODEL"
+export _BX_PI_CONTEXT_WINDOW="$PI_CONTEXT_WINDOW"
+export _BX_PI_MAX_TOKENS="$PI_MAX_TOKENS"
+
+# A machine per working directory, so two projects do not fight over one VM.
+# smolvm allows only a restricted character set in names, so reduce the
+# directory name to [a-z0-9-] rather than passing it through.
+_dir_slug="$(printf '%s' "$(basename "$_mount_dir")" \
+  | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/--*/-/g; s/^-//; s/-$//')"
+[[ -n "$_dir_slug" ]] || _dir_slug="work"
+export BX_IMAGE="${BX_PI_IMAGE:-debian:bookworm-slim}"
+export BX_NAME="${BX_PI_NAME:-pi-${_dir_slug}}"
+export BX_CPUS="${BX_PI_CPUS:-4}"
+export BX_MEM="${BX_PI_MEM:-4096}"
+export BX_RESET="$_reset"
+export BX_KEEP="$_keep"
+export BX_WORKDIR="$_workdir"
+export BX_COMMAND="$_run_pi"
+export BX_BOOTSTRAP="$_bootstrap"
+export BX_DRY_RUN="$_dry_run"
+if [[ -n "${BX_PI_MOUNTS:-}" ]]; then
+  export BX_MOUNTS="${_mount_dir}:/work
+${BX_PI_MOUNTS}"
+else
+  export BX_MOUNTS="${BX_PI_MOUNT:-${_mount_dir}:/work}"
+fi
+# Keep the lock and the recorded shape beside the workdir's local artifacts,
+# so a stale machine is discoverable and the files are easy to ignore.
+export BX_STATE_DIR="${BX_STATE_DIR:-${_mount_dir}/local}"
+if [[ -n "$_extension_src" ]]; then
+  export BX_BOOTSTRAP_ENV="EXTENSION_PATH=/tmp/subconscious-compaction.ts"
+else
+  export BX_BOOTSTRAP_ENV="EXTENSION_PATH="
+fi
+export BX_SECRET_ENV="GATEWAY_URL=_BX_PI_GATEWAY_URL
+API_KEY=_BX_PI_API_KEY
+MODEL=_BX_PI_MODEL
+PI_CONTEXT_WINDOW=_BX_PI_CONTEXT_WINDOW
+PI_MAX_TOKENS=_BX_PI_MAX_TOKENS"
+
+# The bootstrap reads the extension from the guest path, so it must be copied
+# in first: the runner only knows about env and commands, not about `machine cp`.
+if [[ -n "$_extension_src" ]]; then
+  BX_PRE_COMMAND="smolvm machine cp $(printf '%q' "$_extension_src") $(printf '%q' "${BX_NAME}:/tmp/subconscious-compaction.ts") --mode 644 >/dev/null"
+  export BX_PRE_COMMAND
+fi
+
+exec "$_bx"

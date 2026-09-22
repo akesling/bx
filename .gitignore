@@ -1,0 +1,4 @@
+# Local state written by bx runs (locks, recorded machine shapes, artifacts).
+local/
+# Staged package roots and install prefixed builds.
+staging/

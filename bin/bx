@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+# bx — run a command inside a smolvm microVM with host directories mounted.
+#
+# This is the generic core: it creates, starts, feeds, and stops a machine and
+# knows nothing about what runs inside it. A caller supplies the image, the
+# mounts, a bootstrap, and the command through the environment, so a project
+# (or a launcher such as bx-pi) can compose it without editing it.
+#
+# Usage:
+#   bx                 # runs $BX_COMMAND in the guest
+#   bx --dry-run       # print the plan and exit without touching anything
+#   bx --help
+#
+# Configuration (every variable is optional except the command):
+#   BX_IMAGE          guest image             (default debian:bookworm-slim)
+#   BX_NAME           machine name            (default bx)
+#   BX_CPUS           vCPUs                   (default 4)
+#   BX_MEM            memory MiB              (default 4096)
+#   BX_NET            "1" to enable networking (default 1)
+#   BX_RESET          "1" to recreate the VM   (default 0)
+#   BX_KEEP           "1" to leave it running  (default 0)
+#   BX_MOUNTS         newline-separated HOST:GUEST pairs
+#   BX_BOOTSTRAP      shell run once in the guest before the command
+#   BX_PRE_COMMAND    host shell run after start, before the bootstrap
+#   BX_BOOTSTRAP_ENV  newline-separated KEY=VALUE passed to the bootstrap
+#   BX_SECRET_ENV     newline-separated GUESTNAME=HOSTVAR passed by name
+#   BX_WORKDIR        guest directory to run in
+#   BX_COMMAND        shell to run in the guest (required)
+#   BX_STATE_DIR      where lock and recorded shape live (default XDG state
+#                     dir, or $TMPDIR when no home is writable)
+#   BX_DRY_RUN        "1" to print the plan and exit
+#   BX_NO_LOCK        "1" to skip the concurrency lock (tests only)
+#
+# The command runs through `bash -lc` (or `-i -t` when attached to a terminal)
+# and its exit status becomes this script's exit status.
+#
+# Concurrency: one machine may only be driven by one invocation at a time. A
+# lock is taken per machine name; a second invocation fails fast rather than
+# sharing a VM and racing its lifecycle.
+#
+# State: the machine's create-time shape (image, cpus, mem, mounts) is recorded
+# beside the lock. A later run whose shape differs refuses and tells you to
+# pass BX_RESET=1, because smolvm binds mounts at create time and silently
+# reusing a stale set is how boot panics happen.
+
+set -euo pipefail
+
+_die() { printf 'bx: %s\n' "$*" >&2; exit 1; }
+_note() { printf 'bx: %s\n' "$*" >&2; }
+
+_usage() {
+  sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+# ── arguments ───────────────────────────────────────────────────────────────
+# The command comes from the environment (a launcher sets it); the flags here
+# are the few that make sense from a terminal.
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) BX_DRY_RUN=1; shift ;;
+    --reset)   BX_RESET=1; shift ;;
+    --keep)    BX_KEEP=1; shift ;;
+    --name)    [[ $# -ge 2 ]] || _die "--name needs a value"; BX_NAME="$2"; shift 2 ;;
+    --name=*)  BX_NAME="${1#*=}"; shift ;;
+    -h|--help) _usage; exit 0 ;;
+    *)         _die "unknown option: $1 (see --help)" ;;
+  esac
+done
+
+command -v smolvm >/dev/null 2>&1 || _die "smolvm is not on PATH"
+
+_image="${BX_IMAGE:-debian:bookworm-slim}"
+_vm_name="${BX_NAME:-bx}"
+_vm_cpus="${BX_CPUS:-4}"
+_vm_mem="${BX_MEM:-4096}"
+_net="${BX_NET:-1}"
+_reset="${BX_RESET:-0}"
+_keep="${BX_KEEP:-0}"
+_workdir="${BX_WORKDIR:-}"
+_command="${BX_COMMAND:-}"
+_dry_run="${BX_DRY_RUN:-0}"
+_no_lock="${BX_NO_LOCK:-0}"
+
+[[ -n "$_command" ]] || _die "BX_COMMAND is required (nothing to run)"
+[[ "$_vm_name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || \
+  _die "machine name '$_vm_name' is invalid; use letters, digits, '_' or '-'"
+
+# Mounts, bootstrap env, and secret env are newline-separated so a caller can
+# build them with ordinary string concatenation and still name paths with
+# spaces. Empty entries are ignored. Always returns 0: under `set -e` a
+# function whose loop body never runs would otherwise abort the caller.
+_read_lines() {
+  local _line
+  while IFS= read -r _line; do
+    [[ -n "$_line" ]] && printf '%s\n' "$_line"
+  done <<<"${1:-}"
+  return 0
+}
+
+# A stable, comparable rendering of the mount set: order preserved, one per
+# line, so it can be diffed and stored verbatim.
+_want_mounts="$(_read_lines "${BX_MOUNTS:-}")"
+
+# Where to keep the lock and the recorded shape. Callers usually point this at
+# a per-project, git-ignored directory; without a hint, use the XDG state dir
+# so an installed bx works from any directory.
+if [[ -n "${BX_STATE_DIR:-}" ]]; then
+  _state_dir="$BX_STATE_DIR"
+elif [[ -n "${XDG_STATE_HOME:-}" ]]; then
+  _state_dir="${XDG_STATE_HOME}/bx"
+elif [[ -n "${HOME:-}" && -d "${HOME}" ]]; then
+  _state_dir="${HOME}/.local/state/bx"
+else
+  _state_dir="${TMPDIR:-/tmp}/bx"
+fi
+mkdir -p "$_state_dir" 2>/dev/null || _die "could not create state dir $_state_dir"
+_state_file="${_state_dir}/${_vm_name}.state"
+_lock_dir="${_state_dir}/${_vm_name}.lock.d"
+
+_machine_exists() {
+  smolvm machine ls -q 2>/dev/null | grep -qx "$_vm_name"
+}
+
+# The recorded shape, or empty when this name has never been created here.
+_recorded_shape() {
+  [[ -f "$_state_file" ]] && cat "$_state_file"
+}
+
+_want_shape="image=$_image
+cpus=$_vm_cpus
+mem=$_vm_mem
+net=$_net
+mounts:
+$_want_mounts"
+
+_shape_matches() {
+  [[ "$(_recorded_shape)" == "$_want_shape" ]]
+}
+
+# ── plan, before doing anything ─────────────────────────────────────────────
+_exists=0
+_machine_exists && _exists=1
+
+if [[ "$_reset" == "1" ]]; then
+  _action="recreate"
+elif [[ "$_exists" == "0" ]]; then
+  _action="create"
+elif _shape_matches; then
+  _action="reuse"
+else
+  _action="conflict"
+fi
+
+if [[ "$_dry_run" == "1" ]]; then
+  printf 'machine=%s\nimage=%s\ncpus=%s\nmem=%s\nnet=%s\nworkdir=%s\naction=%s\nlock=%s\nstate=%s\nmounts=' \
+    "$_vm_name" "$_image" "$_vm_cpus" "$_vm_mem" "$_net" "${_workdir:-(none)}" \
+    "$_action" "$_lock_dir" "$_state_file"
+  if [[ -n "$_want_mounts" ]]; then
+    printf '\n'
+    printf '%s\n' "$_want_mounts"
+  else
+    printf '(none)\n'
+  fi
+  exit 0
+fi
+
+if [[ "$_action" == "conflict" ]]; then
+  if [[ -z "$(_recorded_shape)" ]]; then
+    _die "machine '$_vm_name' already exists but has no recorded shape (it was
+created before bx tracked state, or by hand). Recreate it so its mounts and
+resources are known: pass --reset (or BX_RESET=1)."
+  fi
+  _die "machine '$_vm_name' was created with a different shape:
+$(printf '%s\n' "$_want_shape" | sed 's/^/  want: /')
+  have:
+$(_recorded_shape | sed 's/^/    /')
+smolvm binds mounts and resources at create time, so this cannot be fixed by
+starting again. Pass --reset (or BX_RESET=1) to recreate it."
+fi
+
+# ── lock ────────────────────────────────────────────────────────────────────
+# One driver per machine. `mkdir` is atomic on every platform (macOS has no
+# flock), so the lock is a directory holding the holder's pid. A second launch
+# fails fast with that pid rather than sharing a VM and racing the stop trap.
+if [[ "$_no_lock" != "1" ]]; then
+  if ! mkdir "$_lock_dir" 2>/dev/null; then
+    _holder="$(cat "$_lock_dir/pid" 2>/dev/null || echo unknown)"
+    if [[ "$_holder" != "unknown" ]] && ! kill -0 "$_holder" 2>/dev/null; then
+      # The holder is gone; a stale lock must not wedge every later launch.
+      rm -rf "$_lock_dir"
+      mkdir "$_lock_dir" 2>/dev/null || _die "could not take lock $_lock_dir"
+    else
+      _die "machine '$_vm_name' is already being driven by pid $_holder
+(lock $_lock_dir). Wait for it to finish, or set BX_KEEP=1 and reuse the
+running machine instead of starting a second one."
+    fi
+  fi
+  printf '%s\n' "$$" >"$_lock_dir/pid"
+fi
+
+# ── lifecycle ───────────────────────────────────────────────────────────────
+if [[ "$_action" == "recreate" && "$_exists" == "1" ]]; then
+  _note "recreating machine $_vm_name"
+  smolvm machine delete --name "$_vm_name" -f >/dev/null 2>&1 || true
+  _exists=0
+fi
+
+if [[ "$_exists" == "0" ]]; then
+  _create_args=(--name "$_vm_name" --image "$_image" --cpus "$_vm_cpus" --mem "$_vm_mem")
+  [[ "$_net" == "1" ]] && _create_args+=(--net)
+  while IFS= read -r _mount; do
+    [[ -n "$_mount" ]] || continue
+    _create_args+=(--volume "$_mount")
+  done < <(printf '%s\n' "$_want_mounts")
+  _note "creating machine $_vm_name from $_image"
+  smolvm machine create "${_create_args[@]}" || _die "could not create machine $_vm_name"
+  printf '%s\n' "$_want_shape" >"$_state_file"
+else
+  _note "reusing machine $_vm_name"
+fi
+
+if ! smolvm machine start --name "$_vm_name" >/dev/null; then
+  _die "machine '$_vm_name' failed to start. If its mounts or image changed
+since it was created, recreate it: bx --reset"
+fi
+
+# Stop the VM on exit unless the caller asked to keep it, and release the lock.
+# The trap runs even after the guest command fails, so the machine is never
+# left running by accident.
+# shellcheck disable=SC2329  # invoked via trap
+_cleanup() {
+  local _status=$?
+  [[ "$_no_lock" == "1" ]] || rm -rf "$_lock_dir"
+  [[ "$_keep" == "1" ]] || smolvm machine stop --name "$_vm_name" >/dev/null 2>&1 || true
+  return "$_status"
+}
+trap '_cleanup; exit $?' EXIT
+
+# A caller may need to move files into the guest before the bootstrap runs
+# (for example `smolvm machine cp`), which only makes sense once the machine
+# is up. It is host-side shell, so it is evaluated here, not in the guest.
+if [[ -n "${BX_PRE_COMMAND:-}" ]]; then
+  bash -c "$BX_PRE_COMMAND"
+fi
+
+# `--secret-env GUEST=HOST` makes smolvm read HOST from this environment and
+# inject it as GUEST, so values never appear in argv or in this script's output.
+_secret_args=()
+while IFS= read -r _pair; do
+  [[ -n "$_pair" ]] || continue
+  _secret_args+=(--secret-env "$_pair")
+done < <(_read_lines "${BX_SECRET_ENV:-}")
+
+_bootstrap_env_args=()
+while IFS= read -r _pair; do
+  [[ -n "$_pair" ]] || continue
+  _bootstrap_env_args+=(--env "$_pair")
+done < <(_read_lines "${BX_BOOTSTRAP_ENV:-}")
+
+if [[ -n "${BX_BOOTSTRAP:-}" ]]; then
+  _note "bootstrap"
+  smolvm machine exec --name "$_vm_name" \
+    ${_secret_args[@]+"${_secret_args[@]}"} \
+    ${_bootstrap_env_args[@]+"${_bootstrap_env_args[@]}"} \
+    -- bash -c "$BX_BOOTSTRAP"
+fi
+
+if [[ -n "$_workdir" ]]; then
+  _command="cd ${_workdir} && ${_command}"
+fi
+
+# Attach a TTY only when there is one; otherwise the caller may be piping.
+# Do not `exec`: the EXIT trap must run to stop the machine and release the
+# lock, and a replaced shell would skip it. Capture the guest status explicitly
+# so it survives the cleanup trap rather than being flattened by `set -e`.
+set +e
+if [[ -t 0 && -t 1 ]]; then
+  smolvm machine exec --name "$_vm_name" -i -t \
+    ${_secret_args[@]+"${_secret_args[@]}"} \
+    -- bash -lc "$_command"
+else
+  smolvm machine exec --name "$_vm_name" \
+    ${_secret_args[@]+"${_secret_args[@]}"} \
+    -- bash -lc "$_command"
+fi
+_guest_status=$?
+set -e
+
+exit "$_guest_status"
