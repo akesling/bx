@@ -125,18 +125,21 @@ printf '@param AGENT_MAX_TOKENS=%s\n' "$_max_tokens"
 printf 'name=%s\n' "pi-${_dir_slug}"
 
 # Secrets cross into the guest by name; the host variables are exported by the
-# resolver's caller (bx) for the bootstrap to read via secret_env.
-printf 'secret_env=GATEWAY_URL=BX_PI_SECRET_GATEWAY\n'
-printf 'secret_env=API_KEY=BX_PI_SECRET_KEY\n'
-printf 'secret_env=MODEL=BX_PI_SECRET_MODEL\n'
-printf 'secret_env=PI_CONTEXT_WINDOW=BX_PI_SECRET_CONTEXT_WINDOW\n'
-printf 'secret_env=PI_MAX_TOKENS=BX_PI_SECRET_MAX_TOKENS\n'
+# resolver's caller (bx) for the bootstrap to read via secret_env. The key is
+# declared `persisted` because the bootstrap writes it into
+# /work/.pi/agent/models.json — the project mount, on your disk — so it is not
+# ephemeral and bx should say so.
+printf 'secret_env=GATEWAY_URL=BX_PI_SECRET_GATEWAY:persisted\n'
+printf 'secret_env=API_KEY=BX_PI_SECRET_KEY:persisted\n'
+printf 'secret_env=MODEL=BX_PI_SECRET_MODEL:persisted\n'
+printf 'secret_env=PI_CONTEXT_WINDOW=BX_PI_SECRET_CONTEXT_WINDOW:persisted\n'
+printf 'secret_env=PI_MAX_TOKENS=BX_PI_SECRET_MAX_TOKENS:persisted\n'
 
 # The extension, if present, is copied into the guest before the bootstrap.
 if [[ -n "$_extension" ]]; then
   printf 'bootstrap_env=EXTENSION_PATH=/tmp/subconscious-compaction.ts\n'
-  printf 'pre_command=smolvm machine cp %s pi-${_dir_slug}:/tmp/subconscious-compaction.ts --mode 644 >/dev/null\n' \
-    "$(printf '%q' "$_extension")"
+  printf 'pre_command=smolvm machine cp %s pi-%s:/tmp/subconscious-compaction.ts --mode 644 >/dev/null 2>&1\n' \
+    "$(printf '%q' "$_extension")" "$_dir_slug"
 fi
 
 # The values the bootstrap and launch need. Emitted as secret_env *sources*,

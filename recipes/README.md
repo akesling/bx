@@ -91,7 +91,7 @@ Every `bx` setting is a recipe key:
 | `keep` / `reset` | lifecycle flags |
 | `bootstrap` | shell run once in the guest before the command |
 | `bootstrap_env` | `KEY=VALUE` for the bootstrap (repeatable) |
-| `secret_env` | `GUEST=HOSTVAR`, passed by name (repeatable) |
+| `secret_env` | `GUEST=HOSTVAR[:LIFETIME]`, passed by name (repeatable) |
 | `pre_command` | host shell run after start, before the bootstrap |
 | `state_dir` | where the lock and recorded shape live |
 | `extends` | inherit from another recipe (see **Composition**) |
@@ -99,6 +99,13 @@ Every `bx` setting is a recipe key:
 
 `mounts`, `bootstrap_env`, and `secret_env` may repeat; the lines are kept in
 order.
+
+A `secret_env` line may declare a **lifetime** after the host variable:
+`GUEST=HOSTVAR:ephemeral` (the default), `:session`, or `:persisted`. The
+lifetime is bx's declaration of how far the value may travel, it is recorded
+in the machine's state and shown by `--dry-run` and `--status`, and it is a
+hard error to misspell one. See the main README's "Secrets and their
+lifetimes" for what bx can and cannot guarantee.
 
 A recipe name must be a shell identifier — letters, digits, and `_`, not
 starting with a digit. This is a limitation of the loader, and it is reported
@@ -168,10 +175,12 @@ KEY=VALUE
 - `@param NAME=VALUE` — declares a parameter and makes `$NAME` available in
   this recipe's values, including in `mounts`.
 - `@secret NAME=VALUE` — hands a value to `bx` out of band, exported as the
-  host variable `NAME` for `secret_env` to pass by name. `@secret` values are
-  never written to the resolved recipe, printed by `--show`, or placed in
-  argv; that is the whole point of the `@` form. A secret declared in
-  `secret_env` must still be listed by the recipe.
+  host variable `NAME` for `secret_env` to pass by name. `@secret` values do
+  not appear in the resolved recipe, in `--show` output, or in argv; that is
+  the point of the `@` form. (The runtime still writes the value into the
+  machine's bundle config; see the main README's "Secrets and their
+  lifetimes".) A secret declared in `secret_env` must still be listed by the
+  recipe.
 - A line that is blank or begins with `#` is ignored.
 - Any other output makes the resolver fail, and `bx` stops.
 

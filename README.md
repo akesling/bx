@@ -91,9 +91,18 @@ wrong:
 - **Dirty exits are cleaned up.** The command's exit status becomes `bx`'s,
   and the machine is still stopped and the lock still released on failure.
 - **Dry run.** `--dry-run` prints the machine, image, resources, mounts, the
-  action it would take, and the lock and state paths — and changes nothing.
+  action it would take, the lock and state paths, the image and toolchain
+  cache state, and a cost estimate — and changes nothing. It needs no `smolvm`
+  on `PATH`.
 - **Secrets stay out of argv.** Values cross into the guest via
-  `smolvm --secret-env`, resolved by name, never as command-line arguments.
+  `smolvm --secret-env`, passed by name, never as command-line arguments. bx
+  also keeps them out of its own state files and `--show` output. See
+  [Secrets and their lifetimes](#secrets-and-their-lifetimes) for what the
+  runtime does with them on disk — the one place bx cannot reach.
+- **A machine is reclaimable.** `--status` lists every machine with the
+  directory it came from, whether that directory still exists, and how big its
+  private state is. `--gc` reclaims machines whose directory is gone, after
+  showing you the list.
 
 ## When it breaks
 
@@ -387,7 +396,7 @@ a key is read from the environment, as a recipe key, or both; `profile`,
 | `BX_BOOTSTRAP` | both | — | shell run once in the guest before the command |
 | `BX_PRE_COMMAND` | both | — | host shell run after start, before the bootstrap |
 | `BX_BOOTSTRAP_ENV` | both | — | newline-separated `KEY=VALUE` for the bootstrap |
-| `BX_SECRET_ENV` | both | — | newline-separated `GUEST=HOSTVAR`, passed by name |
+| `BX_SECRET_ENV` | both | — | newline-separated `GUEST=HOSTVAR[:LIFETIME]`, passed by name |
 | `BX_WORKDIR` | both | — | guest directory to run in |
 | `extends` | recipe | — | inherit from another recipe |
 | `resolve` | recipe | — | run a resolver before merging (see `recipes/README.md`) |
@@ -396,6 +405,49 @@ a key is read from the environment, as a recipe key, or both; `profile`,
 | `BX_STATE_DIR` | both | XDG state dir | where the lock and recorded shape live |
 | `BX_RESET` / `BX_KEEP` | both | `0` | recreate / leave running |
 | `BX_DRY_RUN` | both | `0` | print the plan and exit |
+| `SMOLVM_STORAGE` | env | guest storage root | where `--status`/`--gc` look for machine sizes (inside the machine: `/storage`) |
+
+## Secrets and their lifetimes
+
+A `secret_env` value is written `GUEST=HOSTVAR[:LIFETIME]`, where `LIFETIME`
+is one of:
+
+| Lifetime | Meaning |
+| --- | --- |
+| `ephemeral` (default) | injected into the guest process environment only |
+| `session` | may live in the machine's own writable layer until the machine is deleted |
+| `persisted` | may reach a durable path — the project mount, a file in your repo |
+
+bx uses the lifetime to decide what to warn about. It records the declared
+lifetime in the machine's state, prints it in `--dry-run` and `--status`, and
+prints a warning on any run that declares a `persisted` secret. A typo in the
+lifetime is a hard error, not a silent downgrade.
+
+### What bx does not control
+
+bx keeps secret values out of argv, out of its own state files, and out of
+`--show`. But the runtime writes the environment it launches the guest with
+into the machine's **OCI bundle config**, which is a file on disk under the
+runtime's per-machine overlay directory (inside the guest, visible at
+`/storage/overlays/persistent-<machine>/bundle/config.json`; on the host it is
+under smolvm's own storage root, wherever smolvm keeps it — `/storage` is the
+path *inside* the machine, not a host path). That file contains the secret
+value, and it persists until the machine is deleted. bx cannot see or scrub
+inside it.
+
+The practical consequences:
+
+- Treat smolvm's storage root as secret-bearing, on the host as well as in the
+  guest.
+- Deleting the machine (`bx --reset`, or `bx --gc` after its directory is
+  gone) is what removes it. Stopping the machine does not.
+- Declaring a secret `ephemeral` does not stop the runtime from writing it to
+  that bundle; it is a promise from bx's side, not an enforced boundary on the
+  runtime's. That is why the claim above is scoped to what bx writes.
+
+If the agent config lives under the project mount (as `pi`'s does, at
+`/work/.pi/agent`), the credential is on your disk and in your repo's view.
+Keep that path in `.gitignore`.
 
 ## Development
 
@@ -405,6 +457,11 @@ sh scripts/check.sh      # shellcheck + the test suite
 
 The suite runs entirely on the host against a fake `smolvm` on `PATH`, so it
 needs no VM, no network, and no account.
+
+`tests/invariants.sh` is the second suite: it turns each `never`/`only` claim
+in these docs into an assertion, and greps everything bx writes for a sentinel
+secret. It runs on the host by default; `BX_REAL=1` adds a real isolation suite that
+boots a machine and checks the isolation fence directly.
 
 `scripts/demo.sh` shows the boundary (and refuses to fake it without a real
 `smolvm`); `scripts/bench.sh` produces the Cost table above, and prints no

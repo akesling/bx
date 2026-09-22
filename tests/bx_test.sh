@@ -130,8 +130,14 @@ STATE
     BX_COMMAND="true" BX_STATE_DIR="$d/local" \
     FAKE_VMS="m2" PATH="${_fake_bin_dir}:$PATH" \
     "$_bx" 2>&1)"
-  assert_contains "reusing machine m2" "$out" "reuses"
-  assert_not_contains "creating machine" "$out" "does not recreate"
+  assert_not_contains "creating" "$out" "does not recreate"
+  assert_not_contains "reusing" "$out" "stays quiet about reuse"
+  # The trace is still available, and is where "reusing" lives now.
+  out="$(cd "$d" && BX_VERBOSE=2 BX_NAME=m2 BX_MOUNTS="/only:/only" \
+    BX_COMMAND="true" BX_STATE_DIR="$d/local" \
+    FAKE_VMS="m2" PATH="${_fake_bin_dir}:$PATH" \
+    "$_bx" 2>&1)"
+  assert_contains "reusing machine m2" "$out" "traces the reuse under -v"
   rm -rf "$d"
 }
 
@@ -144,7 +150,7 @@ test_reset_recreates() {
     BX_COMMAND="true" BX_STATE_DIR="$d/local" \
     FAKE_VMS="m3" PATH="${_fake_bin_dir}:$PATH" \
     "$_bx" 2>&1)"
-  assert_contains "recreating machine m3" "$out" "recreates"
+  assert_contains "recreating m3" "$out" "recreates"
   assert_contains "mounts:" "$(cat "$d/local/m3.state")" "records new shape"
   assert_contains "/x:/x" "$(cat "$d/local/m3.state")" "records new mounts"
   rm -rf "$d"
@@ -177,12 +183,71 @@ test_lock_recovers_from_dead_holder() {
     "$_bx" 2>&1)"
   rc=$?
   assert_eq "0" "$rc" "proceeds"
-  assert_contains "creating machine m5" "$out" "creates"
+  assert_contains "creating m5" "$out" "creates"
   if [[ -d "$d/local/m5.lock.d" ]]; then
     _fail "lock was not released"
   else
     _ok
   fi
+  rm -rf "$d"
+}
+
+# ── verbosity ───────────────────────────────────────────────────────────────
+test_quiet_silences_notes_but_not_errors() {
+  _current="--quiet silences status but not errors"
+  local d out
+  d="$(_new_workdir)"
+  # A fresh name the fake does not report, so bx creates and would normally
+  # say so; --quiet must swallow that.
+  out="$(cd "$d" && BX_VERBOSE=0 BX_NAME=mq BX_COMMAND="true" \
+    BX_STATE_DIR="$d/local" \
+    PATH="${_fake_bin_dir}:$PATH" \
+    "$_bx" 2>&1)"
+  assert_eq "" "$out" "no chatter on a quiet run"
+  # A genuine resolution error still speaks, even at --quiet.
+  printf '[nowhere]\ncommand = true\n' >"$d/.bx.conf"
+  out="$(cd "$d" && BX_VERBOSE=0 PATH="${_fake_bin_dir}:$PATH" \
+    "$_bx" --machine ghost nowhere 2>&1)"
+  assert_contains "not defined" "$out" "errors survive --quiet"
+  rm -rf "$d"
+}
+
+test_verbose_shows_smolvm_commands() {
+  _current="--verbose shows the smolvm commands bx runs"
+  local d out
+  d="$(_new_workdir)"
+  # First run creates (fake reports no machine).
+  out="$(cd "$d" && BX_VERBOSE=2 BX_NAME=mv BX_COMMAND="true" \
+    BX_STATE_DIR="$d/local" \
+    PATH="${_fake_bin_dir}:$PATH" \
+    "$_bx" 2>&1)"
+  assert_contains "bx: run:" "$out" "traces commands"
+  # Second run reuses: tell the fake the machine now exists.
+  out="$(cd "$d" && BX_VERBOSE=2 BX_NAME=mv BX_COMMAND="true" \
+    BX_STATE_DIR="$d/local" FAKE_VMS="mv" \
+    PATH="${_fake_bin_dir}:$PATH" \
+    "$_bx" 2>&1)"
+  assert_contains "reusing machine mv" "$out" "traces the reuse"
+  rm -rf "$d"
+}
+
+test_bootstrap_comment_does_not_end_value() {
+  _current="an indented comment inside a bootstrap stays in the value"
+  local d out
+  d="$(_new_workdir)"
+  cat >"$d/.bx.conf" <<'CONF'
+[commented]
+image    = alpine
+mounts   = /a:/a
+bootstrap = set -e
+    # a comment with = in it
+    echo hi
+command  = true
+CONF
+  out="$(cd "$d" && PATH="${_fake_bin_dir}:$PATH" \
+    "$_bx" --show commented 2>&1)"
+  assert_not_contains "unknown key" "$out" "the comment is not parsed as a key"
+  assert_contains "bootstrap=<" "$out" "the bootstrap is still set"
   rm -rf "$d"
 }
 
@@ -643,8 +708,167 @@ EOF
   printf '[pf]\nprofile = fake-profile\n' >"$_rproj/.bx.conf"
   out="$(_run_recipe_bx pf --reset -p hello)"
   assert_contains "profile-args: --reset -p hello" "$out" "forwards args untouched"
-  assert_not_contains "creating machine" "$out" "does not create a machine"
+  assert_not_contains "creating" "$out" "does not create a machine"
   rm -rf "$_rhome" "$_rproj"
+}
+
+# ── secret lifetimes ────────────────────────────────────────────────────────
+test_secret_lifetime_defaults_ephemeral() {
+  _current="a secret without a lifetime is ephemeral and recorded"
+  local d out
+  d="$(_new_workdir)"
+  out="$(cd "$d" && BX_NAME=sl1 BX_COMMAND="true" \
+    BX_SECRET_ENV="API_KEY=THE_KEY" BX_DRY_RUN=1 \
+    BX_STATE_DIR="$d/local" THE_KEY=x \
+    PATH="${_fake_bin_dir}:$PATH" "$_bx" 2>&1)"
+  assert_contains "API_KEY=ephemeral" "$out" "records the default lifetime"
+  rm -rf "$d"
+}
+
+test_secret_lifetime_explicit() {
+  _current="an explicit secret lifetime is parsed and recorded"
+  local d out
+  d="$(_new_workdir)"
+  out="$(cd "$d" && BX_NAME=sl2 BX_COMMAND="true" \
+    BX_SECRET_ENV="API_KEY=THE_KEY:session" BX_DRY_RUN=1 \
+    BX_STATE_DIR="$d/local" THE_KEY=x \
+    PATH="${_fake_bin_dir}:$PATH" "$_bx" 2>&1)"
+  assert_contains "API_KEY=session" "$out" "records the explicit lifetime"
+  rm -rf "$d"
+}
+
+test_secret_lifetime_typo_is_rejected() {
+  _current="a misspelled secret lifetime is a hard error"
+  local d out
+  d="$(_new_workdir)"
+  out="$(cd "$d" && BX_NAME=sl3 BX_COMMAND="true" \
+    BX_SECRET_ENV="API_KEY=THE_KEY:persistant" \
+    BX_STATE_DIR="$d/local" THE_KEY=x \
+    PATH="${_fake_bin_dir}:$PATH" "$_bx" 2>&1)"
+  assert_contains "unknown lifetime" "$out" "names the bad lifetime"
+  rm -rf "$d"
+}
+
+test_secret_persisted_warns() {
+  _current="a persisted secret produces a warning"
+  local d out
+  d="$(_new_workdir)"
+  out="$(cd "$d" && BX_NAME=sl4 BX_COMMAND="true" \
+    BX_SECRET_ENV="API_KEY=THE_KEY:persisted" \
+    BX_STATE_DIR="$d/local" THE_KEY=x \
+    PATH="${_fake_bin_dir}:$PATH" "$_bx" 2>&1)"
+  assert_contains "persisted secret" "$out" "warns"
+  rm -rf "$d"
+}
+
+# ── dry-run cost model ──────────────────────────────────────────────────────
+test_dry_run_reports_cost_model() {
+  _current="--dry-run reports cache state and a cost estimate"
+  local d out
+  d="$(_new_workdir)"
+  out="$(cd "$d" && BX_NAME=dc1 BX_COMMAND="true" BX_DRY_RUN=1 \
+    BX_STATE_DIR="$d/local" \
+    PATH="${_fake_bin_dir}:$PATH" "$_bx" 2>&1)"
+  assert_contains "cache_image=" "$out" "reports image cache state"
+  assert_contains "estimate=" "$out" "reports an estimate"
+  rm -rf "$d"
+}
+
+# ── status and gc ───────────────────────────────────────────────────────────
+test_status_lists_a_machine() {
+  _current="--status lists a machine and where it came from"
+  local d out
+  d="$(_new_workdir)"
+  cat >"$d/local/st1.state" <<STATE
+image=debian:bookworm-slim
+cpus=4
+mem=4096
+net=1
+mounts:
+$d:/work
+secret_lifetimes:
+API_KEY=ephemeral
+origin=$d
+STATE
+  out="$(BX_STATE_DIR="$d/local" PATH="${_fake_bin_dir}:$PATH" \
+    "$_bx" --status 2>&1)"
+  assert_contains "machine:  st1" "$out" "names the machine"
+  assert_contains "origin:   $d (present)" "$out" "reports the origin and it exists"
+  assert_contains "secrets:" "$out" "reports the declared secrets"
+  # The secret block must not bleed into the following scalar line. This was a
+  # real bug: `origin=` was counted as a secret entry.
+  assert_not_contains "secrets:  API_KEY=ephemeral, origin" "$out" \
+    "the secret block leaked the origin line"
+  rm -rf "$d"
+}
+
+test_status_marks_orphan() {
+  _current="--status marks a machine whose directory is gone"
+  local d out
+  d="$(_new_workdir)"
+  cat >"$d/local/st2.state" <<STATE
+image=debian:bookworm-slim
+origin=/no/such/dir/really
+STATE
+  out="$(BX_STATE_DIR="$d/local" PATH="${_fake_bin_dir}:$PATH" \
+    "$_bx" --status 2>&1)"
+  assert_contains "(gone)" "$out" "marks the orphan"
+  rm -rf "$d"
+}
+
+test_gc_previews_then_deletes() {
+  _current="--gc previews an orphan and only deletes with --yes"
+  local d out
+  d="$(_new_workdir)"
+  cat >"$d/local/gc1.state" <<STATE
+image=debian:bookworm-slim
+origin=/no/such/dir/really
+STATE
+  out="$(BX_STATE_DIR="$d/local" PATH="${_fake_bin_dir}:$PATH" \
+    "$_bx" --gc 2>&1)"
+  assert_contains "reclaim: gc1" "$out" "previews the reclaim"
+  assert_contains "pass --yes" "$out" "asks for confirmation"
+  if [[ -f "$d/local/gc1.state" ]]; then _ok; else _fail "preview deleted the state"; fi
+  out="$(BX_STATE_DIR="$d/local" PATH="${_fake_bin_dir}:$PATH" \
+    "$_bx" --gc --yes 2>&1)"
+  assert_contains "deleted: gc1" "$out" "deletes with --yes"
+  if [[ -f "$d/local/gc1.state" ]]; then _fail "state survived deletion"; else _ok; fi
+  rm -rf "$d"
+}
+
+test_gc_keeps_live_machine() {
+  _current="--gc leaves a machine whose directory still exists"
+  local d out
+  d="$(_new_workdir)"
+  cat >"$d/local/gc2.state" <<STATE
+image=debian:bookworm-slim
+origin=$d
+STATE
+  out="$(BX_STATE_DIR="$d/local" PATH="${_fake_bin_dir}:$PATH" \
+    "$_bx" --gc 2>&1)"
+  assert_contains "nothing to reclaim" "$out" "does not reclaim a live machine"
+  rm -rf "$d"
+}
+
+# ── shape compatibility on upgrade ──────────────────────────────────────────
+test_old_state_file_still_reuses() {
+  _current="a pre-upgrade state file (no origin/lifetimes) still reuses"
+  local d out
+  d="$(_new_workdir)"
+  cat >"$d/local/up1.state" <<STATE
+image=debian:bookworm-slim
+cpus=4
+mem=4096
+net=1
+mounts:
+/only:/only
+STATE
+  out="$(cd "$d" && BX_NAME=up1 BX_MOUNTS="/only:/only" \
+    BX_COMMAND="true" BX_STATE_DIR="$d/local" FAKE_VMS="up1" \
+    PATH="${_fake_bin_dir}:$PATH" "$_bx" 2>&1)"
+  assert_not_contains "different shape" "$out" "does not false-conflict"
+  assert_not_contains "creating" "$out" "reuses rather than recreating"
+  rm -rf "$d"
 }
 
 _install_fake_smolvm
@@ -656,6 +880,9 @@ test_reuse_on_unchanged_shape
 test_reset_recreates
 test_lock_blocks_live_holder
 test_lock_recovers_from_dead_holder
+test_quiet_silences_notes_but_not_errors
+test_verbose_shows_smolvm_commands
+test_bootstrap_comment_does_not_end_value
 test_guest_exit_status_propagates
 test_empty_input_does_not_abort
 test_cpu_change_conflicts
@@ -684,6 +911,18 @@ test_recipe_flat_file_holds_both_kinds
 test_recipe_hyphen_name_is_rejected
 test_recipe_machine_recipe_has_no_command
 test_recipe_machine_extends_inherits
+
+# New in S-tier: typed secrets, a cost model, and fleet legibility.
+test_secret_lifetime_defaults_ephemeral
+test_secret_lifetime_explicit
+test_secret_lifetime_typo_is_rejected
+test_secret_persisted_warns
+test_dry_run_reports_cost_model
+test_status_lists_a_machine
+test_status_marks_orphan
+test_gc_previews_then_deletes
+test_gc_keeps_live_machine
+test_old_state_file_still_reuses
 
 printf '\n%d passed, %d failed\n' "$_passed" "$_failed"
 [[ "$_failed" -eq 0 ]]

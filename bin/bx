@@ -3,12 +3,26 @@
 #
 # Usage:
 #   bx <recipe> [args...]   # run a recipe (e.g. `bx pi`)
+#   bx -v <recipe>          # also show the smolvm commands bx runs
+#   bx -q <recipe>          # errors only
 #   bx --list               # list available recipes
 #   bx --show <recipe>      # print the resolved recipe, with provenance
-#   bx --dry-run <recipe>   # print the machine plan without touching smolvm
+#   bx --dry-run <recipe>   # print the machine plan and cost model
+#   bx --status             # list machines: name, dir, image, running, size
+#   bx --gc [--yes]         # reclaim machines whose origin dir is gone (preview first)
 #   bx --new <recipe>       # scaffold a recipe in ~/.bx/recipes
 #   bx --machine <name> <recipe>  # run a recipe on the named machine
 #   bx --help
+#
+# Secrets: a `secret_env` entry is `GUEST=HOSTVAR[:LIFETIME]`, where LIFETIME
+# is `ephemeral` (default), `session`, or `persisted`. `ephemeral` injects the
+# value into the guest process only. `session` also leaves it in the machine's
+# own writable layer (wiped when the machine is deleted). `persisted` means the
+# value may reach a durable path and is the user's explicit choice. bx keeps
+# the value out of argv, its own state files, and --show output, but the
+# runtime writes it into the machine's on-disk bundle config; bx cannot see or
+# scrub inside the runtime's storage. Declaring a lifetime records it and warns
+# when a run would persist a secret.
 #
 # Recipes are declarative: `[name]` followed by `key = value` lines. The
 # recipe book is the product; bx is the interpreter. See recipes/README.md for
@@ -51,15 +65,49 @@
 # State: the machine's create-time shape (image, cpus, mem, mounts) is recorded
 # beside the lock. A later run whose shape differs refuses and tells you to
 # pass --reset, because smolvm binds mounts at create time and silently reusing
-# a stale set is how boot panics happen.
+# a stale set is how boot panics happen. The origin directory and secret
+# lifetimes are recorded too, so `--status` and `--gc` can report and reclaim
+# machines, and so a run can warn before it persists a secret.
 
 set -euo pipefail
 
 _die() { printf 'bx: %s\n' "$*" >&2; exit 1; }
-_note() { printf 'bx: %s\n' "$*" >&2; }
+
+# Three levels of chatter, so a warm run stays quiet and a cold one explains
+# itself. `_note` is for things the user asked to happen (a machine was
+# created, a bootstrap ran); `_say` is the calm one-liner for the common case.
+# Both go to stderr so a recipe's own stdout stays piped-clean. BX_VERBOSE=0
+# (or --quiet) silences everything but errors; BX_VERBOSE=2 (or -v) also shows
+# the smolvm commands bx runs under the covers.
+_verbosity="${BX_VERBOSE:-1}"
+case "$_verbosity" in ''|*[!0-9]*) _verbosity=1 ;; esac
+_note() { [[ "$_verbosity" -ge 1 ]] && printf 'bx: %s\n' "$*" >&2 || true; }
+_say()  { [[ "$_verbosity" -ge 1 ]] && printf '%s\n'    "$*" >&2 || true; }
+_trace(){ [[ "$_verbosity" -ge 2 ]] && printf 'bx: run: %s\n' "$*" >&2 || true; }
+
+# Run a command quietly unless we are verbose, in which case show it (and its
+# output). Used for smolvm subcommands whose banners and progress bars are
+# noise on success but exactly what you want when diagnosing a failure.
+_quiet() {
+  if [[ "$_verbosity" -ge 2 ]]; then _trace "$*"; "$@"; return $?; fi
+  "$@" >/dev/null 2>&1
+}
+
+# Run a command quietly, but replay its captured output to stderr if it fails
+# and keep its exit status. This is what lets a cold `smolvm machine create`
+# be silent on success and still show smolvm's error on failure.
+_quiet_or_die() {
+  local _msg="$1"; shift
+  local _out
+  if [[ "$_verbosity" -ge 2 ]]; then _trace "$*"; "$@"; return $?; fi
+  if ! _out="$("$@" 2>&1)"; then
+    [[ -n "$_out" ]] && printf '%s\n' "$_out" >&2
+    _die "$_msg"
+  fi
+}
 
 _usage() {
-  sed -n '2,44p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,70p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # ── recipes ─────────────────────────────────────────────────────────────────
@@ -87,6 +135,46 @@ _meta_keys="extends resolve machine"
 # line replaces them all. Kept as data so the two rules live in one place.
 _shape_keys="image name cpus mem net mounts workdir bootstrap bootstrap_env secret_env pre_command state_dir"
 
+# ── secret lifetimes ─────────────────────────────────────────────────────────
+# A `secret_env` entry is `GUEST=HOSTVAR[:LIFETIME]`. The lifetime is bx's
+# declaration of how far the value is allowed to travel:
+#   ephemeral (default) — injected into the guest process environment only
+#   session             — may live in the machine's writable layer until deletion
+#   persisted           — may reach a durable path (the project mount, a file)
+# bx does not control the runtime's storage, so it cannot enforce this; it
+# records it, refuses to guess, and warns when a run would carry a value
+# further than the user asked. A declaration that is always a warning is
+# honest; one that silently claims enforcement would not be.
+_secret_lifetimes="ephemeral session persisted"
+
+_is_secret_lifetime() {
+  local _l
+  for _l in $_secret_lifetimes; do [[ "$_l" == "$1" ]] && return 0; done
+  return 1
+}
+
+# Split `GUEST=HOSTVAR[:LIFETIME]` into three globals. The lifetime defaults to
+# ephemeral. A bad lifetime is a hard error, because a typo that silently
+# downgrades a secret to `persisted` is exactly the kind of surprise bx exists
+# to prevent.
+_secret_split() {
+  local _spec="$1"
+  _secret_guest="${_spec%%=*}"
+  _secret_host="${_spec#*=}"
+  _secret_life="ephemeral"
+  case "$_secret_host" in
+    *:*)
+      _secret_life="${_secret_host##*:}"
+      _secret_host="${_secret_host%:*}"
+      _is_secret_lifetime "$_secret_life" || \
+        _die "secret_env '$_spec': unknown lifetime '$_secret_life' (use one of: $_secret_lifetimes)"
+      ;;
+  esac
+  [[ -n "$_secret_guest" && -n "$_secret_host" ]] || \
+    _die "secret_env '$_spec': expected GUEST=HOSTVAR[:LIFETIME]"
+  return 0
+}
+
 _is_shape_key() {
   local _k
   for _k in $_shape_keys; do [[ "$_k" == "$1" ]] && return 0; done
@@ -113,6 +201,17 @@ _trim() {
   printf '%s' "$_s"
 }
 
+# Newline-separated lists (mounts, bootstrap_env, secret_env) come in as one
+# string. Empty entries are ignored. Always returns 0: under `set -e` a
+# function whose loop body never runs would otherwise abort the caller.
+_read_lines() {
+  local _line
+  while IFS= read -r _line; do
+    [[ -n "$_line" ]] && printf '%s\n' "$_line"
+  done <<<"${1:-}"
+  return 0
+}
+
 # Set `_cfg_<name>_<key>` to `value` without interpreting `value` as shell.
 # `printf -v` assigns through a variable name, so a value containing `$`,
 # backticks, or quotes is stored literally. This is what makes the "values are
@@ -134,11 +233,13 @@ _load_file() {
   while IFS= read -r _line || [[ -n "$_line" ]]; do
     # A value continues onto following lines until a new `key = value`, a new
     # `[section]`, or a blank line. This is how a multi-line `bootstrap` is
-    # written. Continuation lines lose only their common reading: a line that
-    # is itself `key = value` (for a known key) starts a new key instead.
+    # written. Indented comment lines and blank-within-a-comment lines stay in
+    # the value: a bootstrap is shell, and shell has comments. Only a genuinely
+    # empty line ends the value, so a recipe author can separate blocks without
+    # the loader swallowing what looks like a key.
     if [[ "$_continuation" == 1 ]]; then
       _candidate="$(_trim "${_line%%#*}")"
-      if [[ -z "$_candidate" ]]; then
+      if [[ -z "$(_trim "$_line")" ]]; then
         _continuation=0; continue
       elif [[ "$_candidate" == '['*']' ]]; then
         _continuation=0 # a new section ends the value; handled below
@@ -473,7 +574,14 @@ _apply_recipe_key() { # key value
 }
 
 _dump_recipe() {
-  local _name="$1"
+  local _name="$1" _spec
+  # Validate secret lifetimes even when inspecting, so a typo is caught by
+  # `--show` rather than only at run time. `_show` never runs the guest, so
+  # this is safe to do here.
+  while IFS= read -r _spec; do
+    [[ -n "$_spec" ]] || continue
+    _secret_split "$_spec"
+  done < <(_read_lines "${BX_SECRET_ENV:-}")
   printf 'recipe=%s\n' "$_name"
   printf 'command=%s\n' "${BX_COMMAND:-}"
   printf 'image=%s\n' "${BX_IMAGE:-debian:bookworm-slim}"
@@ -512,6 +620,9 @@ _scaffold_recipe() {
   mkdir -p "$_dir" || _die "could not create $_dir"
   _file="${_dir}/${_name}.conf"
   [[ -e "$_file" ]] && _die "$_file already exists"
+  # The heredoc body is a recipe template, not shell; shellcheck reads the
+  # `machine = ` lines as assignments.
+  # shellcheck disable=SC2283
   cat >"$_file" <<EOF
 # ${_name} — a bx recipe. Run it with: bx ${_name}
 #
@@ -542,6 +653,8 @@ EOF
 _recipe=""
 _show=""
 _new_recipe=""
+_show_status=""
+_gc=""
 BX_PROFILE=""
 _name_overridden=""
 _passthrough=()
@@ -553,11 +666,16 @@ while [[ $# -gt 0 ]]; do
     --dry-run) BX_DRY_RUN=1; _own_flags+=(--dry-run); shift ;;
     --reset)   BX_RESET=1; _own_flags+=(--reset); shift ;;
     --keep)    BX_KEEP=1; _own_flags+=(--keep); shift ;;
+    -q|--quiet)   _verbosity=0; _own_flags+=("$1"); shift ;;
+    -v|--verbose) _verbosity=2; _own_flags+=("$1"); shift ;;
     --name)    [[ $# -ge 2 ]] || _die "--name needs a value"; BX_NAME="$2"; _name_overridden=1; shift 2 ;;
     --name=*)  BX_NAME="${1#*=}"; _name_overridden=1; shift ;;
     --machine) [[ $# -ge 2 ]] || _die "--machine needs a value"; BX_MACHINE="$2"; shift 2 ;;
     --machine=*) BX_MACHINE="${1#*=}"; shift ;;
     --list)    _load_sources; _recipe_list; exit 0 ;;
+    --status)  _show_status=1; shift ;;
+    --gc)      _gc=1; shift ;;
+    --yes|-y)  _gc_yes=1; shift ;;
     --new)     [[ $# -ge 2 ]] || _die "--new needs a recipe name"; _new_recipe="$2"; shift 2 ;;
     --new=*)   _new_recipe="${1#*=}"; shift ;;
     --show)    [[ $# -ge 2 ]] || _die "--show needs a recipe name"; _show="$2"; shift 2 ;;
@@ -576,8 +694,136 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Where to keep the lock and the recorded shape. Callers usually point this at
+# a per-project, git-ignored directory; without a hint, use the XDG state dir
+# so an installed bx works from any directory. Called from `--status`/`--gc`
+# and from the run path, so the resolution lives in exactly one place.
+_resolve_state_dir() {
+  if [[ -n "${BX_STATE_DIR:-}" ]]; then
+    printf '%s' "$BX_STATE_DIR"
+  elif [[ -n "${XDG_STATE_HOME:-}" ]]; then
+    printf '%s' "${XDG_STATE_HOME}/bx"
+  elif [[ -n "${HOME:-}" && -d "${HOME}" ]]; then
+    printf '%s' "${HOME}/.local/state/bx"
+  else
+    printf '%s' "${TMPDIR:-/tmp}/bx"
+  fi
+}
+
+# Record the origin directory and secret lifetimes in the state file so
+# `--status` can say where a machine came from and whether it may be reclaimed,
+# and so a later run can warn about a persisted secret. A `1` marker means a
+# non-ephemeral secret was declared for that machine.
+_origin_dir() { printf '%s' "${BX_PI_DIR:-$PWD}"; }
+
+# Machines are the `.state` files in the state dir. Their name is the file
+# stem; the lock is `<name>.lock.d`.
+_state_machines() {
+  local _d _f _n
+  _d="$(_resolve_state_dir)"
+  [[ -d "$_d" ]] || return 0
+  for _f in "$_d"/*.state; do
+    [[ -f "$_f" ]] || continue
+    _n="$(basename "$_f")"; _n="${_n%.state}"
+    printf '%s\n' "$_n"
+  done
+  return 0
+}
+
+_state_field() { # statefile key
+  [[ -f "$1" ]] || return 0
+  sed -n "s/^$2=//p" "$1" | head -1
+}
+
+# A block field: everything after `key:` until the next top-level field, which
+# is either `name:` (another block) or `name=` (a scalar). Used for
+# secret_lifetimes, which is multi-line.
+_state_block() { # statefile key
+  [[ -f "$1" ]] || return 0
+  sed -n "/^$2:/,/^[a-z_]*[=:]/p" "$1" | sed '1d' | sed '/^[a-z_]*[=:]/d'
+}
+
+# `--status` prints one machine per block: the recorded shape summary, the
+# origin directory, whether that directory still exists (so the machine is
+# reclaimable), whether it is running according to smolvm, and how big its
+# private state is. This is the answer to "what exists, where, and from
+# where" that the lifecycle otherwise leaves implicit.
+_status_action() {
+  local _name _file _origin _dir_ok _running _lifetimes _size _found=0
+  while IFS= read -r _name; do
+    [[ -n "$_name" ]] || continue
+    _found=1
+    _file="$(_resolve_state_dir)/${_name}.state"
+    _origin="$(_state_field "$_file" origin)"
+    _dir_ok="gone"
+    [[ -n "$_origin" && -d "$_origin" ]] && _dir_ok="present"
+    _running="stopped"
+    if command -v smolvm >/dev/null 2>&1 && smolvm machine ls -q 2>/dev/null | grep -qx "$_name"; then
+      _running="exists"
+    fi
+    _lifetimes="$(_state_block "$_file" secret_lifetimes)"
+    _lifetimes="${_lifetimes//$'\n'/, }"
+    _size="?"
+    _size_dir="${SMOLVM_STORAGE:-/storage}/overlays/persistent-${_name}"
+    [[ -d "$_size_dir" ]] && _size="$(du -sh "$_size_dir" 2>/dev/null | cut -f1)"
+    printf 'machine:  %s\n' "$_name"
+    printf 'image:    %s\n' "$(_state_field "$_file" image)"
+    printf 'origin:   %s (%s)\n' "${_origin:-(unknown)}" "$_dir_ok"
+    printf 'smolvm:   %s\n' "$_running"
+    printf 'size:     %s\n' "$_size"
+    [[ -n "$_lifetimes" ]] && printf 'secrets:  %s\n' "$_lifetimes"
+    printf 'state:    %s\n' "$_file"
+    printf '\n'
+  done < <(_state_machines)
+  [[ "$_found" == 1 ]] || printf 'no machines in %s\n' "$(_resolve_state_dir)"
+  return 0
+}
+
+# `--gc` deletes machines whose origin directory no longer exists. It prints
+# the plan first and only acts with `--yes`, because deletion is the one thing
+# here that is not reversible by reading state. A machine kept running on
+# purpose (`--keep`) is reclaimed too: its origin is gone, so it is orphaned.
+_gc_action() {
+  local _name _file _origin _reclaim=0
+  while IFS= read -r _name; do
+    [[ -n "$_name" ]] || continue
+    _file="$(_resolve_state_dir)/${_name}.state"
+    _origin="$(_state_field "$_file" origin)"
+    if [[ -n "$_origin" && -d "$_origin" ]]; then
+      continue
+    fi
+    _reclaim=$((_reclaim + 1))
+    printf 'reclaim: %s (origin %s is gone)\n' "$_name" "${_origin:-(unknown)}"
+    if [[ "${_gc_yes:-0}" == "1" ]]; then
+      if command -v smolvm >/dev/null 2>&1; then
+        _quiet smolvm machine delete --name "$_name" -f || \
+          printf 'bx: could not delete machine %s\n' "$_name" >&2
+      fi
+      rm -f "$_file"
+      rm -rf "$(_resolve_state_dir)/${_name}.lock.d"
+      printf 'deleted: %s\n' "$_name"
+    fi
+  done < <(_state_machines)
+  if [[ "$_reclaim" == 0 ]]; then
+    printf 'nothing to reclaim\n'
+  elif [[ "${_gc_yes:-0}" != "1" ]]; then
+    printf '\npass --yes to delete the above\n'
+  fi
+  return 0
+}
+
 if [[ -n "$_new_recipe" ]]; then
   _scaffold_recipe "$_new_recipe"
+  exit 0
+fi
+
+if [[ "${_show_status:-}" == "1" ]]; then
+  _status_action
+  exit 0
+fi
+
+if [[ "${_gc:-}" == "1" ]]; then
+  _gc_action
   exit 0
 fi
 
@@ -615,7 +861,8 @@ if [[ -n "$BX_PROFILE" ]]; then
   exec "$BX_PROFILE" ${_own_flags[@]+"${_own_flags[@]}"} ${_passthrough[@]+"${_passthrough[@]}"}
 fi
 
-command -v smolvm >/dev/null 2>&1 || _die "smolvm is not on PATH"
+command -v smolvm >/dev/null 2>&1 || _smolvm_present=0
+_smolvm_present="${_smolvm_present:-1}"
 
 _image="${BX_IMAGE:-debian:bookworm-slim}"
 _vm_name="${BX_NAME:-bx}"
@@ -638,18 +885,6 @@ fi
 [[ "$_vm_name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || \
   _die "machine name '$_vm_name' is invalid; use letters, digits, '_' or '-'"
 
-# Mounts, bootstrap env, and secret env are newline-separated so a caller can
-# build them with ordinary string concatenation and still name paths with
-# spaces. Empty entries are ignored. Always returns 0: under `set -e` a
-# function whose loop body never runs would otherwise abort the caller.
-_read_lines() {
-  local _line
-  while IFS= read -r _line; do
-    [[ -n "$_line" ]] && printf '%s\n' "$_line"
-  done <<<"${1:-}"
-  return 0
-}
-
 # A stable, comparable rendering of the mount set: order preserved, one per
 # line, so it can be diffed and stored verbatim.
 _want_mounts="$(_read_lines "${BX_MOUNTS:-}")"
@@ -657,20 +892,13 @@ _want_mounts="$(_read_lines "${BX_MOUNTS:-}")"
 # Where to keep the lock and the recorded shape. Callers usually point this at
 # a per-project, git-ignored directory; without a hint, use the XDG state dir
 # so an installed bx works from any directory.
-if [[ -n "${BX_STATE_DIR:-}" ]]; then
-  _state_dir="$BX_STATE_DIR"
-elif [[ -n "${XDG_STATE_HOME:-}" ]]; then
-  _state_dir="${XDG_STATE_HOME}/bx"
-elif [[ -n "${HOME:-}" && -d "${HOME}" ]]; then
-  _state_dir="${HOME}/.local/state/bx"
-else
-  _state_dir="${TMPDIR:-/tmp}/bx"
-fi
+_state_dir="$(_resolve_state_dir)"
 mkdir -p "$_state_dir" 2>/dev/null || _die "could not create state dir $_state_dir"
 _state_file="${_state_dir}/${_vm_name}.state"
 _lock_dir="${_state_dir}/${_vm_name}.lock.d"
 
 _machine_exists() {
+  [[ "$_smolvm_present" == "1" ]] || return 1
   smolvm machine ls -q 2>/dev/null | grep -qx "$_vm_name"
 }
 
@@ -685,12 +913,91 @@ mem=$_vm_mem
 net=$_net
 mounts:
 $_want_mounts"
+# Normalize the trailing newline once, so the in-memory shape and the one read
+# back from disk are byte-identical. Without this, an empty mount list leaves a
+# stray blank line that makes a machine look like it changed shape every run.
+_want_shape="${_want_shape%$'\n'}"
 
+# Parse the secret list once, into the args smolvm needs plus the lifetimes bx
+# records. The declared lifetime is a property of the shape, so a run that
+# changes it (e.g. a value gaining `:persisted`) is a shape change and is
+# reconciled like any other. This is what makes a secret's reach auditable
+# instead of implicit.
+_secret_args=()
+_secret_lifetimes_record=""
+while IFS= read -r _spec; do
+  [[ -n "$_spec" ]] || continue
+  _secret_split "$_spec"
+  _secret_args+=(--secret-env "${_secret_guest}=${_secret_host}")
+  _secret_lifetimes_record="${_secret_lifetimes_record}${_secret_guest}=${_secret_life}
+"
+done < <(_read_lines "${BX_SECRET_ENV:-}")
+_secret_lifetimes_record="${_secret_lifetimes_record%$'\n'}"
+_want_shape="${_want_shape}
+secret_lifetimes:
+${_secret_lifetimes_record}"
+_want_shape="${_want_shape}
+origin=$(_origin_dir)"
+
+# A value declared `persisted` is allowed to reach a durable path, so bx says
+# so on every run rather than letting it disappear into a machine and reappear
+# in a repository. This is a warning, not a refusal: `persisted` is a valid,
+# explicit choice.
+if [[ "$_secret_lifetimes_record" == *"=persisted"* ]]; then
+  _note "this machine declares a persisted secret; its value may reach a durable path"
+fi
+
+# The shape's stable core is the create-time binding smolvm fixes: image,
+# resources, and mounts. `secret_lifetimes` and `origin` are bx bookkeeping —
+# they are recorded and reported, but they are not bound by smolvm at create
+# time, so a change in them must not force a recreate. Keeping the comparison
+# on the core means an old state file (written before these fields existed)
+# still matches and reuses, rather than becoming a false conflict on upgrade.
 _shape_matches() {
-  [[ "$(_recorded_shape)" == "$_want_shape" ]]
+  [[ "$(_recorded_shape)" == "$_want_shape" ]] && return 0
+  # Fall back to comparing only the smolvm-bound core, so a record that lacks
+  # the newer bookkeeping fields still reuses a matching machine.
+  _rec="$(_recorded_shape)"
+  [[ -n "$_rec" ]] || return 1
+  local _rec_core _want_core
+  _rec_core="$_rec"; _rec_core="${_rec_core%%$'\n'secret_lifetimes:*}"
+  _rec_core="${_rec_core%%$'\n'origin=*}"
+  _want_core="$_want_shape"; _want_core="${_want_core%%$'\n'secret_lifetimes:*}"
+  _want_core="${_want_core%%$'\n'origin=*}"
+  [[ "$_rec_core" == "$_want_core" ]]
 }
 
 # ── plan, before doing anything ─────────────────────────────────────────────
+
+# Is the image already in the runtime's store, and does this machine already
+# carry the toolchain in its writable layer? bx cannot see inside the runtime's
+# storage in general, but the common smolvm layout is documented (see README),
+# and a probe that answers "cached / not cached" is far more useful than a
+# guess. When the layout is absent, the answer is `unknown`, never a silent
+# `no`, so the cost line stays honest.
+_image_cached() {
+  local _root="${SMOLVM_STORAGE:-/storage}"
+  local _safe
+  _safe="$(printf '%s' "$1" | sed 's#[/:]#_#g')"
+  if [[ -d "$_root/manifests" ]]; then
+    [[ -f "$_root/manifests/${_safe}.json" ]] && { printf 'cached'; return 0; }
+    printf 'not cached'; return 0
+  fi
+  printf 'unknown'
+}
+
+_toolchain_present() {
+  local _root="${SMOLVM_STORAGE:-/storage}"
+  local _upper="$_root/overlays/persistent-${_vm_name}/upper"
+  if [[ -d "$_upper" ]]; then
+    if [[ -e "$_upper/root/.bun" || -e "$_upper/usr/local/bin/pi" ]]; then
+      printf 'present'; return 0
+    fi
+    printf 'absent'; return 0
+  fi
+  printf 'unknown'
+}
+
 _exists=0
 _machine_exists && _exists=1
 
@@ -714,9 +1021,25 @@ if [[ "$_dry_run" == "1" ]]; then
   else
     printf '(none)\n'
   fi
+  # The cost model. A first run is slow because of the toolchain install, not
+  # because of the image; say which of the two applies, from state, so the
+  # wait is predicted rather than discovered.
+  [[ -n "$_secret_lifetimes_record" ]] && printf 'secret_lifetimes:\n%s\n' "$_secret_lifetimes_record"
+  printf 'cache_image=%s\ncache_toolchain=%s\n' "$(_image_cached "$_image")" "$(_toolchain_present)"
+  case "$_action" in
+    create|recreate)
+      printf 'estimate=first run in this directory: vm boot + toolchain install (network); later runs in this dir reuse the machine\n' ;;
+    reuse)
+      printf 'estimate=warm run: machine exists and matches the requested shape\n' ;;
+    conflict)
+      printf 'estimate=no run: the shape changed; pass --reset to recreate\n' ;;
+  esac
   exit 0
 fi
 
+# A real run needs the runtime. `--dry-run` deliberately does not, so the plan
+# and cost model can be inspected on a host without smolvm installed.
+[[ "$_smolvm_present" == "1" ]] || _die "smolvm is not on PATH (it is required for a real run; --dry-run and --status do not need it)"
 if [[ "$_action" == "conflict" ]]; then
   if [[ -z "$(_recorded_shape)" ]]; then
     _die "machine '$_vm_name' already exists but has no recorded shape (it was
@@ -753,8 +1076,8 @@ fi
 
 # ── lifecycle ───────────────────────────────────────────────────────────────
 if [[ "$_action" == "recreate" && "$_exists" == "1" ]]; then
-  _note "recreating machine $_vm_name"
-  smolvm machine delete --name "$_vm_name" -f >/dev/null 2>&1 || true
+  _say "recreating $_vm_name"
+  _quiet smolvm machine delete --name "$_vm_name" -f || true
   _exists=0
 fi
 
@@ -765,17 +1088,22 @@ if [[ "$_exists" == "0" ]]; then
     [[ -n "$_mount" ]] || continue
     _create_args+=(--volume "$_mount")
   done < <(printf '%s\n' "$_want_mounts")
-  _note "creating machine $_vm_name from $_image"
-  smolvm machine create "${_create_args[@]}" || _die "could not create machine $_vm_name"
+  # A first run is the only slow, chatty one: image pull, rootfs unpack. Say so
+  # plainly, and surface smolvm's own output if it fails.
+  _say "creating $_vm_name from $_image (first run; this may take a minute)"
+  _quiet_or_die "could not create machine $_vm_name" smolvm machine create "${_create_args[@]}"
   printf '%s\n' "$_want_shape" >"$_state_file"
 else
-  _note "reusing machine $_vm_name"
+  # Warm path: the machine already exists with the right shape. Stay quiet
+  # about reusing it — the user does not need to be told nothing happened.
+  _trace "reusing machine $_vm_name"
 fi
 
-if ! smolvm machine start --name "$_vm_name" >/dev/null; then
-  _die "machine '$_vm_name' failed to start. If its mounts or image changed
-since it was created, recreate it: bx --reset"
-fi
+# Starting a stopped machine is an expected, silent step. Only replay smolvm's
+# banner if it actually fails, or if the user asked for the trace.
+_quiet_or_die "machine '$_vm_name' failed to start. If its mounts or image changed
+since it was created, recreate it: bx --reset" \
+  smolvm machine start --name "$_vm_name"
 
 # Stop the VM on exit unless the caller asked to keep it, and release the lock.
 # The trap runs even after the guest command fails, so the machine is never
@@ -784,7 +1112,7 @@ fi
 _cleanup() {
   local _status=$?
   [[ "$_no_lock" == "1" ]] || rm -rf "$_lock_dir"
-  [[ "$_keep" == "1" ]] || smolvm machine stop --name "$_vm_name" >/dev/null 2>&1 || true
+  [[ "$_keep" == "1" ]] || _quiet smolvm machine stop --name "$_vm_name" || true
   return "$_status"
 }
 trap '_cleanup; exit $?' EXIT
@@ -793,16 +1121,9 @@ trap '_cleanup; exit $?' EXIT
 # (for example `smolvm machine cp`), which only makes sense once the machine
 # is up. It is host-side shell, so it is evaluated here, not in the guest.
 if [[ -n "${BX_PRE_COMMAND:-}" ]]; then
+  _trace "pre_command"
   bash -c "$BX_PRE_COMMAND"
 fi
-
-# `--secret-env GUEST=HOST` makes smolvm read HOST from this environment and
-# inject it as GUEST, so values never appear in argv or in this script's output.
-_secret_args=()
-while IFS= read -r _pair; do
-  [[ -n "$_pair" ]] || continue
-  _secret_args+=(--secret-env "$_pair")
-done < <(_read_lines "${BX_SECRET_ENV:-}")
 
 _bootstrap_env_args=()
 while IFS= read -r _pair; do
@@ -811,11 +1132,19 @@ while IFS= read -r _pair; do
 done < <(_read_lines "${BX_BOOTSTRAP_ENV:-}")
 
 if [[ -n "${BX_BOOTSTRAP:-}" ]]; then
-  _note "bootstrap"
+  # The bootstrap is idempotent and runs on every boot, so it is only worth a
+  # line when it actually installs something; on a warm machine it is a no-op
+  # and printing "bootstrap" every launch is the noise this script exists to
+  # avoid. `-v` always shows it.
+  _trace "bootstrap"
+  set +e
   smolvm machine exec --name "$_vm_name" \
     ${_secret_args[@]+"${_secret_args[@]}"} \
     ${_bootstrap_env_args[@]+"${_bootstrap_env_args[@]}"} \
     -- bash -c "$BX_BOOTSTRAP"
+  _bootstrap_status=$?
+  set -e
+  [[ "$_bootstrap_status" == 0 ]] || exit "$_bootstrap_status"
 fi
 
 if [[ -n "$_workdir" ]]; then
