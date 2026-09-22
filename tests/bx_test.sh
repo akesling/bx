@@ -256,6 +256,133 @@ test_invalid_machine_name_is_rejected() {
   rm -rf "$d"
 }
 
+# ── recipes ─────────────────────────────────────────────────────────────────
+# Recipe tests isolate HOME and the working directory so the user's real
+# ~/.bx.conf never leaks into a run.
+_recipe_env() {
+  _rhome="$(mktemp -d)"
+  _rproj="$(mktemp -d)"
+}
+
+_run_recipe_bx() {
+  ( cd "$_rproj" && HOME="$_rhome" \
+    PATH="${_fake_bin_dir}:$PATH" XDG_STATE_HOME="$_rproj/state" \
+    "$_bx" "$@" 2>&1 )
+}
+
+test_recipe_lookup_and_merge() {
+  _current="a project recipe merges over home defaults"
+  local out
+  _recipe_env
+  cat >"$_rhome/.bx.conf" <<'EOF'
+[test]
+command = make test
+cpus = 2
+EOF
+  cat >"$_rproj/.bx.conf" <<'EOF'
+[test]
+cpus = 8
+EOF
+  out="$(_run_recipe_bx --show test)"
+  assert_contains "command=make test" "$out" "keeps home command"
+  assert_contains "cpus=8" "$out" "project overrides cpus"
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_mounts_accumulate() {
+  _current="repeated mounts accumulate in read order"
+  local out
+  _recipe_env
+  cat >"$_rhome/.bx.conf" <<'EOF'
+[test]
+command = true
+mounts = /a:/a
+EOF
+  cat >"$_rproj/.bx.conf" <<'EOF'
+[test]
+mounts = /b:/b
+EOF
+  out="$(_run_recipe_bx --show test)"
+  assert_contains "/a:/a" "$out" "home mount present"
+  assert_contains "/b:/b" "$out" "project mount present"
+  if [[ "${out%%/b:/b*}" == *"/a:/a"* ]]; then _ok; else _fail "order was not preserved"; fi
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_variable_expansion() {
+  _current="\$PWD expands and a recipe is not shell-evaluated"
+  local out
+  _recipe_env
+  cat >"$_rproj/.bx.conf" <<'EOF'
+[echo]
+command = true
+mounts = $PWD:/work
+EOF
+  out="$(_run_recipe_bx --show echo)"
+  assert_contains "${_rproj}:/work" "$out" "\$PWD expanded"
+  cat >"$_rproj/.bx.conf" <<'EOF'
+[evil]
+command = $(touch /tmp/bx-should-not-exist)
+EOF
+  out="$(_run_recipe_bx --show evil)"
+  # The recipe is data, not shell: $(...) must survive verbatim and must not run.
+  _literal='$'"(touch /tmp/bx-should-not-exist)"
+  assert_contains "$_literal" "$out" "command substitution is literal"
+  if [[ -e /tmp/bx-should-not-exist ]]; then
+    _fail "a recipe evaluated shell code"
+  else
+    _ok
+  fi
+  rm -rf "$_rhome" "$_rproj" /tmp/bx-should-not-exist
+}
+
+test_recipe_unknown_key_is_rejected() {
+  _current="a misspelled key is rejected, not ignored"
+  local out
+  _recipe_env
+  printf '[bad]\ncomand = typo\n' >"$_rproj/.bx.conf"
+  out="$(_run_recipe_bx --show bad)"
+  assert_contains "unknown key 'comand'" "$out" "names the key"
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_unknown_name_is_rejected() {
+  _current="an unknown recipe lists what exists"
+  local out
+  _recipe_env
+  out="$(_run_recipe_bx --show nosuch)"
+  assert_contains "no recipe named 'nosuch'" "$out" "names the miss"
+  assert_contains "pi" "$out" "lists pi"
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_list() {
+  _current="--list shows recipes plus the built-in pi"
+  local out
+  _recipe_env
+  printf '[alpha]\ncommand = true\n' >"$_rproj/.bx.conf"
+  out="$(_run_recipe_bx --list)"
+  assert_contains "alpha" "$out" "lists alpha"
+  assert_contains "pi" "$out" "lists pi"
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_profile_hands_off() {
+  _current="a profile recipe hands off without creating a machine"
+  local out
+  _recipe_env
+  cat >"${_fake_bin_dir}/fake-profile" <<'EOF'
+#!/usr/bin/env bash
+printf 'profile-args: %s\n' "$*"
+EOF
+  chmod +x "${_fake_bin_dir}/fake-profile"
+  printf '[pf]\nprofile = fake-profile\n' >"$_rproj/.bx.conf"
+  out="$(_run_recipe_bx pf --reset -p hello)"
+  assert_contains "profile-args: --reset -p hello" "$out" "forwards args untouched"
+  assert_not_contains "creating machine" "$out" "does not create a machine"
+  rm -rf "$_rhome" "$_rproj"
+}
+
 _install_fake_smolvm
 trap '_remove_fake_smolvm' EXIT
 
@@ -270,6 +397,13 @@ test_empty_input_does_not_abort
 test_cpu_change_conflicts
 test_unknown_option_is_rejected
 test_invalid_machine_name_is_rejected
+test_recipe_lookup_and_merge
+test_recipe_mounts_accumulate
+test_recipe_variable_expansion
+test_recipe_unknown_key_is_rejected
+test_recipe_unknown_name_is_rejected
+test_recipe_list
+test_recipe_profile_hands_off
 
 printf '\n%d passed, %d failed\n' "$_passed" "$_failed"
 [[ "$_failed" -eq 0 ]]

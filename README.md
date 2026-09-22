@@ -26,33 +26,84 @@ login (`subc login`) or `SUBCONSCIOUS_API_KEY`.
 
 ## Use
 
-The command comes from the environment, so a project wires `bx` in without
-forking it:
+The short form is a **recipe**: a named, declarative command in `~/.bx.conf`
+or `./.bx.conf`. Run it by name.
 
 ```sh
-export BX_MOUNTS="$PWD:/work"
-export BX_WORKDIR=/work
-export BX_COMMAND="make test"
-bx
+bx pi            # the bundled pi recipe
+bx test          # a recipe you wrote
+bx --list        # what is available
 ```
 
-Or from a terminal:
+A recipe is `[name]` followed by `key = value` lines. Only `command` is
+required; every other key is a `bx` setting (see the table below).
+
+```ini
+# ~/.bx.conf — defaults for every project
+[test]
+command = make test
+cpus    = 8
+mounts  = $PWD:/work
+workdir = /work
+```
+
+```ini
+# ./.bx.conf — this project only
+[test]
+mounts = $PWD:/src     # added to the mount set, in read order
+[serve]
+command = python3 -m http.server
+```
+
+Sources are read in increasing precedence: built-in defaults, `~/.bx.conf`,
+`./.bx.conf`, then per-recipe files `~/.bx/recipes/<name>.conf` and
+`./.bx/recipes/<name>.conf`. A later source overrides a scalar key; the
+multi-valued keys `mounts`, `bootstrap_env`, and `secret_env` accumulate.
+Inspect the merge without running anything:
 
 ```sh
-bx --dry-run            # print the plan and touch nothing
-bx --reset              # recreate a machine whose shape drifted
-bx --keep               # leave the machine running afterwards
+bx --show test       # the fully resolved recipe
+bx --dry-run test    # the machine plan it would produce
+```
+
+Values are data, not shell: `$(...)` stays literal and is never evaluated.
+`~`, `$HOME`, and `$PWD` are expanded because a mount is written with them.
+A misspelled key is an error, not a silently ignored line.
+
+Extra arguments after the recipe name are appended to its command, so
+`bx test --verbose` runs `make test --verbose` in the guest.
+
+### Profiles
+
+A recipe may name a host-side `profile` instead of a guest `command`. The
+profile owns its own machine, so `bx` hands off rather than starting a second
+one. That is how the bundled `pi` recipe works:
+
+```ini
+[pi]
+profile = bx-pi
+```
+
+### No recipe needed
+
+Any setting can still come from the environment for an ad-hoc run, and the
+environment beats a recipe:
+
+```sh
+export BX_MOUNTS="$PWD:/work" BX_WORKDIR=/work BX_COMMAND="make test"
+bx
 ```
 
 ## bx-pi
 
 `bx-pi` runs the [pi](https://github.com/earendil-works/pi-coding-agent) agent
 inside the guest, with the Subconscious provider configured and bun + pi
-installed on first use:
+installed on first use. It is the bundled `pi` recipe, so `bx pi` and `bx-pi`
+are the same run:
 
 ```sh
 cd ~/src/some-project
-bx-pi -p "run the tests and summarize the failures"
+bx pi -p "run the tests and summarize the failures"
 ```
 
 Each working directory gets its own machine (named `pi-<dirname>`), mounted at
@@ -95,6 +146,7 @@ Every variable is optional except the command.
 | `BX_BOOTSTRAP_ENV` | — | newline-separated `KEY=VALUE` for the bootstrap |
 | `BX_SECRET_ENV` | — | newline-separated `GUEST=HOSTVAR`, passed by name |
 | `BX_WORKDIR` | — | guest directory to run in |
+| `profile` | — | recipe key: hand off to a host-side executable |
 | `BX_STATE_DIR` | XDG state dir | where the lock and recorded shape live |
 | `BX_RESET` / `BX_KEEP` | `0` | recreate / leave running |
 | `BX_DRY_RUN` | `0` | print the plan and exit |

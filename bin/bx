@@ -1,38 +1,31 @@
 #!/usr/bin/env bash
-# bx — run a command inside a smolvm microVM with host directories mounted.
-#
-# This is the generic core: it creates, starts, feeds, and stops a machine and
-# knows nothing about what runs inside it. A caller supplies the image, the
-# mounts, a bootstrap, and the command through the environment, so a project
-# (or a launcher such as bx-pi) can compose it without editing it.
+# bx — run a named recipe inside a smolvm microVM with host directories mounted.
 #
 # Usage:
-#   bx                 # runs $BX_COMMAND in the guest
-#   bx --dry-run       # print the plan and exit without touching anything
+#   bx <recipe> [args...]   # run a recipe (e.g. `bx pi`)
+#   bx --list               # list available recipes
+#   bx --show <recipe>      # print the resolved recipe without running it
+#   bx --dry-run <recipe>   # print the machine plan without touching smolvm
 #   bx --help
 #
-# Configuration (every variable is optional except the command):
-#   BX_IMAGE          guest image             (default debian:bookworm-slim)
-#   BX_NAME           machine name            (default bx)
-#   BX_CPUS           vCPUs                   (default 4)
-#   BX_MEM            memory MiB              (default 4096)
-#   BX_NET            "1" to enable networking (default 1)
-#   BX_RESET          "1" to recreate the VM   (default 0)
-#   BX_KEEP           "1" to leave it running  (default 0)
-#   BX_MOUNTS         newline-separated HOST:GUEST pairs
-#   BX_BOOTSTRAP      shell run once in the guest before the command
-#   BX_PRE_COMMAND    host shell run after start, before the bootstrap
-#   BX_BOOTSTRAP_ENV  newline-separated KEY=VALUE passed to the bootstrap
-#   BX_SECRET_ENV     newline-separated GUESTNAME=HOSTVAR passed by name
-#   BX_WORKDIR        guest directory to run in
-#   BX_COMMAND        shell to run in the guest (required)
-#   BX_STATE_DIR      where lock and recorded shape live (default XDG state
-#                     dir, or $TMPDIR when no home is writable)
-#   BX_DRY_RUN        "1" to print the plan and exit
-#   BX_NO_LOCK        "1" to skip the concurrency lock (tests only)
+# Recipes are declarative: `[name]` followed by `key = value` lines, read from
+# (in increasing precedence) the built-in defaults, ~/.bx.conf, ./.bx.conf, and
+# per-recipe files under ~/.bx/recipes/ and ./.bx/recipes/. A recipe inherits
+# the home and project defaults and may override any setting. Only `command`
+# is required; the built-in `pi` recipe is always available.
+#
+# Recipe keys (every bx setting):
+#   command, image, name, cpus, mem, net, mounts, workdir, keep, reset,
+#   bootstrap, bootstrap_env, secret_env, pre_command, state_dir
+# `mounts`, `bootstrap_env`, and `secret_env` may repeat; their lines are kept
+# in order. `#` starts a comment; values run to end of line after trimming.
 #
 # The command runs through `bash -lc` (or `-i -t` when attached to a terminal)
-# and its exit status becomes this script's exit status.
+# and its exit status becomes this script's exit status. Extra arguments after
+# the recipe name are appended to the recipe's command.
+#
+# Environment overrides remain: any BX_* variable (BX_IMAGE, BX_CPUS, …) beats
+# the config file, so an ad-hoc run needs no recipe.
 #
 # Concurrency: one machine may only be driven by one invocation at a time. A
 # lock is taken per machine name; a second invocation fails fast rather than
@@ -40,8 +33,8 @@
 #
 # State: the machine's create-time shape (image, cpus, mem, mounts) is recorded
 # beside the lock. A later run whose shape differs refuses and tells you to
-# pass BX_RESET=1, because smolvm binds mounts at create time and silently
-# reusing a stale set is how boot panics happen.
+# pass --reset, because smolvm binds mounts at create time and silently reusing
+# a stale set is how boot panics happen.
 
 set -euo pipefail
 
@@ -49,23 +42,249 @@ _die() { printf 'bx: %s\n' "$*" >&2; exit 1; }
 _note() { printf 'bx: %s\n' "$*" >&2; }
 
 _usage() {
-  sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+# ── recipes ─────────────────────────────────────────────────────────────────
+# A recipe is a `[name]` section of `key = value` lines. This is deliberately
+# not TOML: the loader must work with nothing but bash, so the grammar is the
+# smallest one bash can parse unambiguously. Values are taken verbatim (after
+# trimming); repeating a multi-valued key appends rather than replaces.
+#
+# Bash 3.2 has no associative arrays, so a section's keys are held in variables
+# named `_cfg_<recipe>_<key>`. Each `_load_file` overwrites a scalar (so the
+# last file read wins) and appends to a multi-valued key (so all sources
+# contribute, in the order read: home, project, per-recipe).
+
+_recipe_keys="command image name cpus mem net mounts workdir keep reset bootstrap bootstrap_env secret_env pre_command state_dir profile"
+_multi_keys="mounts bootstrap_env secret_env"
+
+_known_key() {
+  local _k
+  for _k in $_recipe_keys; do [[ "$_k" == "$1" ]] && return 0; done
+  return 1
+}
+
+_is_multi_key() {
+  local _k
+  for _k in $_multi_keys; do [[ "$_k" == "$1" ]] && return 0; done
+  return 1
+}
+
+# Trim leading and trailing whitespace without external tools.
+_trim() {
+  local _s="$1"
+  _s="${_s#"${_s%%[![:space:]]*}"}"
+  _s="${_s%"${_s##*[![:space:]]}"}"
+  printf '%s' "$_s"
+}
+
+_load_file() {
+  local _file="$1" _line _section="" _key _val
+  [[ -f "$_file" ]] || return 0
+  while IFS= read -r _line || [[ -n "$_line" ]]; do
+    _line="$(_trim "${_line%%#*}")"
+    [[ -n "$_line" ]] || continue
+    if [[ "$_line" == '['*']' ]]; then
+      _section="$(_trim "${_line#[}")"
+      _section="$(_trim "${_section%]}")"
+      [[ -n "$_section" ]] || _die "$_file: empty recipe name"
+      case "$_recipe_names" in
+        *"
+${_section}
+"*) ;;
+        *) _recipe_names="${_recipe_names}${_section}
+" ;;
+      esac
+      continue
+    fi
+    [[ -n "$_section" ]] || _die "$_file: line outside a [recipe]: $_line"
+    _key="$(_trim "${_line%%=*}")"
+    _val="$(_trim "${_line#*=}")"
+    [[ "$_line" == *=* ]] || _die "$_file: expected 'key = value': $_line"
+    _known_key "$_key" || _die "$_file: unknown key '$_key' in [$_section]"
+    # Expand the three references a recipe author actually reaches for, so a
+    # mount can be written `$PWD:/work` or `~/src:/src`. Nothing else is
+    # expanded: values are not shell-evaluated, so a recipe cannot run code.
+    case "$_val" in
+      *\$PWD*|*\$HOME*|*'~'*)
+        _val="${_val//\$PWD/$PWD}"
+        _val="${_val//\$HOME/${HOME:-}}"
+        # A leading ~ is the home directory; there is no other tilde form here.
+        case "$_val" in
+          "~"/*) _val="${HOME:-}${_val:1}" ;;
+          "~")   _val="${HOME:-}" ;;
+        esac ;;
+    esac
+    if _is_multi_key "$_key"; then
+      eval "_cfg_${_section}_${_key}=\"\${_cfg_${_section}_${_key}:+\${_cfg_${_section}_${_key}}
+}${_val}\""
+    else
+      eval "_cfg_${_section}_${_key}=\$_val"
+    fi
+  done <"$_file"
+}
+
+# The names a recipe can refer to: every [section] seen, plus the built-in pi.
+_recipe_names=""
+_has_recipe() {
+  local _name="$1"
+  [[ "$_name" == "pi" ]] && return 0
+  case "
+${_recipe_names}" in
+    *"
+${_name}
+"*) return 0 ;;
+  esac
+  return 1
+}
+
+_recipe_list() {
+  local _r
+  for _r in $_recipe_names pi; do
+    [[ -n "$_r" ]] && printf '%s\n' "$_r"
+  done | sort -u
+  return 0
+}
+
+# Load every config source into scope. Call once, before resolving a recipe.
+_load_sources() {
+  _recipe_names=""
+  _load_file "${HOME:-}/.bx.conf"
+  _load_file "./.bx.conf"
+  local _rf
+  for _rf in "${HOME:-}/.bx/recipes" ./.bx/recipes; do
+    [[ -d "$_rf" ]] || continue
+    local _f
+    for _f in "$_rf"/*.conf; do
+      [[ -f "$_f" ]] || continue
+      _load_file "$_f"
+    done
+  done
+}
+
+# Merge `_cfg_<name>_*` into BX_* variables. Scalar keys: a later source has
+# already overwritten the variable, so it is the winner. Multi keys: the value
+# accumulated in read order.
+_resolve_recipe() {
+  local _name="$1" _key _val
+  # The built-in pi recipe is the profile that ships with bx. A `profile =` key
+  # delegates the whole run to a host-side launcher (which owns its own
+  # machine), so bx must not also create one. A user's own [pi] section, or a
+  # pi.conf, is loaded first and wins over this default.
+  if [[ "$_name" == "pi" ]]; then
+    BX_PROFILE="${BX_PROFILE:-bx-pi}"
+  fi
+  for _key in $_recipe_keys; do
+    eval "_val=\${_cfg_${_name}_${_key}:-}"
+    [[ -n "$_val" ]] || continue
+    case "$_key" in
+      command)       BX_COMMAND="$_val" ;;
+      image)         BX_IMAGE="$_val" ;;
+      name)          BX_NAME="$_val" ;;
+      cpus)          BX_CPUS="$_val" ;;
+      mem)           BX_MEM="$_val" ;;
+      net)           BX_NET="$_val" ;;
+      mounts)        BX_MOUNTS="$_val" ;;
+      workdir)       BX_WORKDIR="$_val" ;;
+      keep)          BX_KEEP="$_val" ;;
+      reset)         BX_RESET="$_val" ;;
+      bootstrap)     BX_BOOTSTRAP="$_val" ;;
+      bootstrap_env) BX_BOOTSTRAP_ENV="$_val" ;;
+      secret_env)    BX_SECRET_ENV="$_val" ;;
+      pre_command)   BX_PRE_COMMAND="$_val" ;;
+      state_dir)     BX_STATE_DIR="$_val" ;;
+      profile)       BX_PROFILE="$_val" ;;
+    esac
+  done
+}
+
+_dump_recipe() {
+  local _name="$1"
+  printf 'recipe=%s\n' "$_name"
+  printf 'command=%s\n' "${BX_COMMAND:-}"
+  printf 'image=%s\n' "${BX_IMAGE:-debian:bookworm-slim}"
+  printf 'name=%s\n' "${BX_NAME:-bx}"
+  printf 'cpus=%s\n' "${BX_CPUS:-4}"
+  printf 'mem=%s\n' "${BX_MEM:-4096}"
+  printf 'net=%s\n' "${BX_NET:-1}"
+  printf 'workdir=%s\n' "${BX_WORKDIR:-(none)}"
+  printf 'keep=%s\n' "${BX_KEEP:-0}"
+  printf 'reset=%s\n' "${BX_RESET:-0}"
+  [[ -n "${BX_PROFILE:-}" ]] && printf 'profile=%s\n' "$BX_PROFILE"
+  printf 'mounts=\n%s\n' "${BX_MOUNTS:-(none)}"
+  [[ -n "${BX_BOOTSTRAP_ENV:-}" ]] && printf 'bootstrap_env=\n%s\n' "$BX_BOOTSTRAP_ENV"
+  [[ -n "${BX_SECRET_ENV:-}" ]] && printf 'secret_env=\n%s\n' "$BX_SECRET_ENV"
+  [[ -n "${BX_PRE_COMMAND:-}" ]] && printf 'pre_command=%s\n' "$BX_PRE_COMMAND"
+  return 0
 }
 
 # ── arguments ───────────────────────────────────────────────────────────────
-# The command comes from the environment (a launcher sets it); the flags here
-# are the few that make sense from a terminal.
+# A bare word is a recipe name; flags are handled first so a recipe can never
+# be shadowed by an option. Everything after the recipe is forwarded to it.
+_recipe=""
+_show=""
+BX_PROFILE=""
+_passthrough=()
+# Flags bx consumed for itself, kept so they can be replayed to a profile
+# recipe, which owns its own machine and therefore wants --reset/--keep too.
+_own_flags=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --dry-run) BX_DRY_RUN=1; shift ;;
-    --reset)   BX_RESET=1; shift ;;
-    --keep)    BX_KEEP=1; shift ;;
+    --dry-run) BX_DRY_RUN=1; _own_flags+=(--dry-run); shift ;;
+    --reset)   BX_RESET=1; _own_flags+=(--reset); shift ;;
+    --keep)    BX_KEEP=1; _own_flags+=(--keep); shift ;;
     --name)    [[ $# -ge 2 ]] || _die "--name needs a value"; BX_NAME="$2"; shift 2 ;;
     --name=*)  BX_NAME="${1#*=}"; shift ;;
+    --list)    _load_sources; _recipe_list; exit 0 ;;
+    --show)    [[ $# -ge 2 ]] || _die "--show needs a recipe name"; _show="$2"; shift 2 ;;
+    --show=*)  _show="${1#*=}"; shift ;;
     -h|--help) _usage; exit 0 ;;
-    *)         _die "unknown option: $1 (see --help)" ;;
+    --)        shift; _passthrough+=("$@"); break ;;
+    -*)
+      # Before a recipe is named, an unknown option is a mistake. After one, it
+      # belongs to the recipe: `bx pi --reset -p hi` forwards both to bx-pi.
+      if [[ -n "$_recipe" ]]; then _passthrough+=("$1"); shift
+      else _die "unknown option: $1 (see --help)"; fi ;;
+    *)
+      if [[ -z "$_recipe" ]]; then _recipe="$1"; shift
+      else _passthrough+=("$1"); shift; fi ;;
   esac
 done
+
+if [[ -n "$_show" || -n "$_recipe" ]]; then
+  _load_sources
+  _target="${_show:-$_recipe}"
+  _has_recipe "$_target" || _die "no recipe named '$_target' (available: $(printf '%s' "$(_recipe_list)" | tr '\n' ' '))"
+  _resolve_recipe "$_target"
+fi
+
+if [[ -n "$_show" ]]; then
+  _dump_recipe "$_show"
+  exit 0
+fi
+
+# Extra arguments after the recipe are appended to its command, so
+# `bx pi -p "hi"` forwards `-p "hi"` to pi.
+if [[ ${#_passthrough[@]} -gt 0 ]]; then
+  for _arg in "${_passthrough[@]}"; do
+    printf -v _quoted '%q' "$_arg"
+    BX_COMMAND="${BX_COMMAND:-} ${_quoted}"
+  done
+fi
+
+# A recipe may name a host-side profile instead of describing a guest command.
+# The profile owns its own machine (bx-pi does), so bx hands off rather than
+# starting one of its own: this is what makes `bx pi` mean "run the pi
+# profile" without nesting a VM inside a VM. Arguments pass through untouched,
+# and `--dry-run` is the profile's to interpret (bx-pi has its own plan).
+if [[ -n "$BX_PROFILE" ]]; then
+  command -v "$BX_PROFILE" >/dev/null 2>&1 || \
+    _die "profile '$BX_PROFILE' is not on PATH"
+  # Replay the flags bx parsed for itself first, then the recipe's own args:
+  # the profile owns the machine, so --reset/--keep/--dry-run are its to honor.
+  exec "$BX_PROFILE" ${_own_flags[@]+"${_own_flags[@]}"} ${_passthrough[@]+"${_passthrough[@]}"}
+fi
 
 command -v smolvm >/dev/null 2>&1 || _die "smolvm is not on PATH"
 
@@ -81,7 +300,7 @@ _command="${BX_COMMAND:-}"
 _dry_run="${BX_DRY_RUN:-0}"
 _no_lock="${BX_NO_LOCK:-0}"
 
-[[ -n "$_command" ]] || _die "BX_COMMAND is required (nothing to run)"
+[[ -n "$_command" ]] || _die "no command: name a recipe (bx <recipe>) or set BX_COMMAND"
 [[ "$_vm_name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || \
   _die "machine name '$_vm_name' is invalid; use letters, digits, '_' or '-'"
 
@@ -168,14 +387,14 @@ if [[ "$_action" == "conflict" ]]; then
   if [[ -z "$(_recorded_shape)" ]]; then
     _die "machine '$_vm_name' already exists but has no recorded shape (it was
 created before bx tracked state, or by hand). Recreate it so its mounts and
-resources are known: pass --reset (or BX_RESET=1)."
+resources are known: pass --reset."
   fi
   _die "machine '$_vm_name' was created with a different shape:
 $(printf '%s\n' "$_want_shape" | sed 's/^/  want: /')
   have:
 $(_recorded_shape | sed 's/^/    /')
 smolvm binds mounts and resources at create time, so this cannot be fixed by
-starting again. Pass --reset (or BX_RESET=1) to recreate it."
+starting again. Pass --reset to recreate it."
 fi
 
 # ── lock ────────────────────────────────────────────────────────────────────
