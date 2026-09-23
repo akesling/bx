@@ -407,6 +407,31 @@ a key is read from the environment, as a recipe key, or both; `profile`,
 | `BX_DRY_RUN` | both | `0` | print the plan and exit |
 | `SMOLVM_STORAGE` | env | guest storage root | where `--status`/`--gc` look for machine sizes (inside the machine: `/storage`) |
 
+## Running commands, faithfully
+
+`bx pi` should be hard to tell apart from running `pi` in the ways the user
+controls — and deliberately different in the ways isolation requires. The
+fidelity guarantees:
+
+- **Exit status is the guest command's.** bx exits with exactly the status the
+guest returned; it does not flatten it.
+- **Signals reach the guest.** `bx` runs the exec in the foreground, so a
+  terminal's `Ctrl-C`, `TERM`, and resize (`WINCH`) go to the whole foreground
+  job — `smolvm` and, through it, the guest — exactly as they would to `pi` run
+  directly. `bx` still runs its cleanup (stop the machine, release the lock) on
+  the way out.
+- **A piped run is silent.** bx's narration about the machine (creating it,
+  starting it, the persisted-secret warning) is suppressed when stderr is not
+  a terminal, so `bx pi | grep x` carries only the command's own output.
+  Setting `BX_VERBOSE` (or `-v`) is an explicit request and always wins.
+- **A curated environment is forwarded.** `TERM`, `LANG`/`LC_*`, `COLORTERM`,
+  and `TZ` cross into the guest so programs render and sort as they do
+  locally. Nothing else does — no `EDITOR`, no `SSH_AUTH_SOCK`, no credentials.
+
+What stays different, on purpose: the environment is not your machine. There
+is no `~/.ssh`, no host cache, and a fresh home. Chasing literal identity here
+would mean leaking the host, which is the opposite of the point.
+
 ## Secrets and their lifetimes
 
 A `secret_env` value is written `GUEST=HOSTVAR[:LIFETIME]`, where `LIFETIME`

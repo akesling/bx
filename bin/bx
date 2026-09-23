@@ -75,15 +75,38 @@ _die() { printf 'bx: %s\n' "$*" >&2; exit 1; }
 
 # Three levels of chatter, so a warm run stays quiet and a cold one explains
 # itself. `_note` is for things the user asked to happen (a machine was
-# created, a bootstrap ran); `_say` is the calm one-liner for the common case.
-# Both go to stderr so a recipe's own stdout stays piped-clean. BX_VERBOSE=0
-# (or --quiet) silences everything but errors; BX_VERBOSE=2 (or -v) also shows
-# the smolvm commands bx runs under the covers.
+# created, a bootstrap ran). It goes to stderr so a recipe's own stdout stays
+# piped-clean. BX_VERBOSE=0 (or --quiet) silences everything but errors;
+# BX_VERBOSE=2 (or -v) also shows the smolvm commands bx runs under the covers.
+#
+# A `_run_*` message is incidental narration about the machine on the way to
+# running the recipe — it is suppressed when stderr is not a terminal, because
+# a caller that piped the guest's output asked for the guest's output, not a
+# story about the machine. So `bx pi | grep x` and `pi | grep x` agree. An
+# explicit subcommand (`--new`, `--status`, `--gc`) always prints: its output
+# is the thing the user asked for, not a side effect. Setting BX_VERBOSE (or
+# -v) is an explicit request, so it always wins over the tty heuristic.
 _verbosity="${BX_VERBOSE:-1}"
 case "$_verbosity" in ''|*[!0-9]*) _verbosity=1 ;; esac
 _note() { [[ "$_verbosity" -ge 1 ]] && printf 'bx: %s\n' "$*" >&2 || true; }
-_say()  { [[ "$_verbosity" -ge 1 ]] && printf '%s\n'    "$*" >&2 || true; }
 _trace(){ [[ "$_verbosity" -ge 2 ]] && printf 'bx: run: %s\n' "$*" >&2 || true; }
+# Run-path narration: like _note, but the calm one-liner form for a step the
+# user watches happen ("creating …"), and silent when stderr is not a tty and
+# the user did not explicitly ask for verbosity.
+if [[ -n "${BX_VERBOSE:-}" || "$_verbosity" -ge 2 ]]; then
+  _run_verbosity="$_verbosity"
+else
+  _run_verbosity="$_verbosity"; [[ -t 2 ]] || _run_verbosity=0
+fi
+_run_note() { [[ "$_run_verbosity" -ge 1 ]] && printf 'bx: %s\n' "$*" >&2 || true; }
+_run_say()  { [[ "$_run_verbosity" -ge 1 ]] && printf '%s\n'    "$*" >&2 || true; }
+
+# Host environment a program expects to inherit, so a command inside the
+# machine behaves as it does on the host for the things a user controls:
+# terminal type, locale, and colour. Only these are forwarded. The fence is
+# deliberate — a credential or socket variable is never on this list, so
+# forwarding the environment for fidelity does not leak the host.
+_bx_env_passthrough="TERM COLORTERM LANG LANGUAGE LC_ALL LC_CTYPE LC_MESSAGES LC_COLLATE TZ"
 
 # Run a command quietly unless we are verbose, in which case show it (and its
 # output). Used for smolvm subcommands whose banners and progress bars are
@@ -632,7 +655,7 @@ _scaffold_recipe() {
 #
 #   machine = <name>
 #
-# A command recipe may still override any shape key after `machine =`.
+# A command recipe may still override any shape key after \`machine =\`.
 #
 # The format is documented in the shipped book: share/bx/recipes/README.md.
 
@@ -939,12 +962,15 @@ ${_secret_lifetimes_record}"
 _want_shape="${_want_shape}
 origin=$(_origin_dir)"
 
-# A value declared `persisted` is allowed to reach a durable path, so bx says
-# so on every run rather than letting it disappear into a machine and reappear
-# in a repository. This is a warning, not a refusal: `persisted` is a valid,
-# explicit choice.
+# A value declared `persisted` is allowed to reach a durable path. Say so when
+# the machine is created — but not on every warm run: the warning is about the
+# machine's shape, which is fixed at create time, so repeating it on each
+# attach is the kind of chatter that makes `bx pi` feel unlike `pi`. `--status`
+# always carries it, and `-v` shows it on any run.
 if [[ "$_secret_lifetimes_record" == *"=persisted"* ]]; then
-  _note "this machine declares a persisted secret; its value may reach a durable path"
+  _persisted_secret=1
+else
+  _persisted_secret=0
 fi
 
 # The shape's stable core is the create-time binding smolvm fixes: image,
@@ -1076,7 +1102,7 @@ fi
 
 # ── lifecycle ───────────────────────────────────────────────────────────────
 if [[ "$_action" == "recreate" && "$_exists" == "1" ]]; then
-  _say "recreating $_vm_name"
+  _run_say "recreating $_vm_name"
   _quiet smolvm machine delete --name "$_vm_name" -f || true
   _exists=0
 fi
@@ -1090,7 +1116,9 @@ if [[ "$_exists" == "0" ]]; then
   done < <(printf '%s\n' "$_want_mounts")
   # A first run is the only slow, chatty one: image pull, rootfs unpack. Say so
   # plainly, and surface smolvm's own output if it fails.
-  _say "creating $_vm_name from $_image (first run; this may take a minute)"
+  _run_say "creating $_vm_name from $_image (first run; this may take a minute)"
+  [[ "$_persisted_secret" == "1" ]] && \
+    _run_note "this machine declares a persisted secret; its value may reach a durable path"
   _quiet_or_die "could not create machine $_vm_name" smolvm machine create "${_create_args[@]}"
   printf '%s\n' "$_want_shape" >"$_state_file"
 else
@@ -1131,6 +1159,17 @@ while IFS= read -r _pair; do
   _bootstrap_env_args+=(--env "$_pair")
 done < <(_read_lines "${BX_BOOTSTRAP_ENV:-}")
 
+# Forward the curated host environment (terminal type, locale, colour) so a
+# program inside the machine behaves as it does on the host for the things a
+# user controls. Only variables on the allowlist cross; a credential or socket
+# variable is never included. `smolvm --env NAME=VALUE` sets the guest value
+# literally, so each is expanded from the host here.
+_passthrough_env_args=()
+for _name in $_bx_env_passthrough; do
+  _val="${!_name:-}"
+  [[ -n "$_val" ]] && _passthrough_env_args+=(--env "${_name}=${_val}")
+done
+
 if [[ -n "${BX_BOOTSTRAP:-}" ]]; then
   # The bootstrap is idempotent and runs on every boot, so it is only worth a
   # line when it actually installs something; on a warm machine it is a no-op
@@ -1151,18 +1190,33 @@ if [[ -n "$_workdir" ]]; then
   _command="cd ${_workdir} && ${_command}"
 fi
 
-# Attach a TTY only when there is one; otherwise the caller may be piping.
-# Do not `exec`: the EXIT trap must run to stop the machine and release the
-# lock, and a replaced shell would skip it. Capture the guest status explicitly
-# so it survives the cleanup trap rather than being flattened by `set -e`.
+# Attach a TTY only when stdin and stdout are terminals; otherwise the caller
+# may be piping and smolvm must not try to allocate a pty. This mirrors how a
+# shell decides, so `bx pi` and `pi` agree on whether they are interactive.
+#
+# Run smolvm in the foreground, never `&`/background. A backgrounded process
+# group is not the terminal's foreground group, so the `-i -t` exec is stopped
+# by SIGTTIN the moment it reads stdin, never receives SIGWINCH, and leaves a
+# TUI like pi with the wrong width — while an interactive `bx bash` accepts
+# keystrokes that are merely echoed by the local terminal and never reach the
+# guest. In the foreground the kernel delivers Ctrl-C and SIGWINCH to the whole
+# job, so the guest gets a clean interrupt and a correctly sized pty, and `bx`
+# and `pi` agree.
+#
+# Do not `exec` either: the EXIT trap must run to stop the machine and release
+# the lock, and a replaced shell would skip it. Capture the guest status
+# explicitly so it survives the cleanup trap rather than being flattened by
+# `set -e`.
 set +e
 if [[ -t 0 && -t 1 ]]; then
   smolvm machine exec --name "$_vm_name" -i -t \
     ${_secret_args[@]+"${_secret_args[@]}"} \
+    ${_passthrough_env_args[@]+"${_passthrough_env_args[@]}"} \
     -- bash -lc "$_command"
 else
   smolvm machine exec --name "$_vm_name" \
     ${_secret_args[@]+"${_secret_args[@]}"} \
+    ${_passthrough_env_args[@]+"${_passthrough_env_args[@]}"} \
     -- bash -lc "$_command"
 fi
 _guest_status=$?

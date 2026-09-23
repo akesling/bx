@@ -124,6 +124,76 @@ CONF
   rm -rf "$d"
 }
 
+# ── host: a run piped is silent on stderr ───────────────────────────────────
+# The whole point of the fidelity work: `bx pi | grep x` must not be polluted
+# by bx's own narration about the machine. Run narration is suppressed when
+# stderr is not a terminal and the user did not ask for verbosity.
+test_piped_run_is_silent() {
+  _current="a piped run adds no narration to stderr"
+  local d err
+  d="$(_new_tmp)"
+  mkdir -p "$d/bin"
+  cat >"$d/bin/smolvm" <<'FAKE'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "machine ls") ;;
+  "machine exec") printf 'guest output\n'; exit 0 ;;
+  "machine start"|"machine stop"|"machine create"|"machine delete") exit 0 ;;
+esac
+exit 0
+FAKE
+  chmod +x "$d/bin/smolvm"
+  cat >"$d/.bx.conf" <<'CONF'
+[quiet]
+image   = debian:bookworm-slim
+mounts  = /tmp:/work
+command = true
+CONF
+  # A fresh machine name: the run will create it, which is the noisy path.
+  err="$(cd "$d" && BX_NAME=quietinv BX_STATE_DIR="$d/state" \
+    PATH="$d/bin:$PATH" "$_bx" quiet 2>&1 >/dev/null)"
+  assert_absent "creating" "$err" "piped run leaked create narration"
+  assert_absent "bx:" "$err" "piped run leaked a bx-prefixed line"
+  rm -rf "$d"
+}
+
+# ── host: env passthrough forwards only the allowlist ───────────────────────
+# Fidelity must not become a leak: TERM/LANG cross, credentials do not.
+test_env_passthrough_is_curated() {
+  _current="env passthrough forwards the allowlist and nothing secret"
+  local d log
+  d="$(_new_tmp)"
+  log="$d/calls.log"
+  mkdir -p "$d/bin"
+  cat >"$d/bin/smolvm" <<FAKE
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$(printf '%q' "$log")"
+case "\$1 \$2" in
+  "machine ls") ;;
+  "machine exec") exit 0 ;;
+  *) exit 0 ;;
+esac
+FAKE
+  chmod +x "$d/bin/smolvm"
+  cat >"$d/.bx.conf" <<'CONF'
+[env]
+image   = debian:bookworm-slim
+mounts  = /tmp:/work
+command = true
+CONF
+  (cd "$d" && TERM=xterm-color LANG=en_US.UTF-8 TZ=UTC \
+     AWS_SECRET_ACCESS_KEY="$_sentinel" EDITOR=vim \
+     BX_NAME=envinv BX_STATE_DIR="$d/state" PATH="$d/bin:$PATH" \
+     "$_bx" env >/dev/null 2>&1)
+  local calls
+  calls="$(cat "$log" 2>/dev/null)"
+  assert_present 'TERM=xterm-color' "$calls" "TERM was not forwarded"
+  assert_present 'LANG=en_US.UTF-8' "$calls" "LANG was not forwarded"
+  assert_absent "$_sentinel" "$calls" "a credential was forwarded"
+  assert_absent 'EDITOR=vim' "$calls" "a non-allowlisted var was forwarded"
+  rm -rf "$d"
+}
+
 # ── host: docs and code agree ───────────────────────────────────────────────
 # Every "never"/"only" claim in the docs must be listed here with the test that
 # backs it. This list is the contract; adding a claim without adding an
@@ -142,6 +212,8 @@ test_claims_are_backed() {
     "Values are data, not shell:test_recipe_is_never_shell"
     "passed by name:test_secret_absent_from_argv"
     "out of its own state files:test_secret_absent_from_state_and_show"
+    "A piped run is silent:test_piped_run_is_silent"
+    "A curated environment is forwarded:test_env_passthrough_is_curated"
   )
   local _c _phrase _fn
   for _c in "${_claims[@]}"; do
@@ -277,6 +349,8 @@ _remove_fake() { :; }
 test_secret_absent_from_state_and_show
 test_secret_absent_from_argv
 test_recipe_is_never_shell
+test_piped_run_is_silent
+test_env_passthrough_is_curated
 test_claims_are_backed
 test_dry_run_needs_no_smolvm
 test_boot_probe_accepts_macos

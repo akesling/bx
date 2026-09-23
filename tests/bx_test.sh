@@ -146,7 +146,7 @@ test_reset_recreates() {
   local d out
   d="$(_new_workdir)"
   printf 'image=other\n' >"$d/local/m3.state"
-  out="$(cd "$d" && BX_NAME=m3 BX_RESET=1 BX_MOUNTS="/x:/x" \
+  out="$(cd "$d" && BX_VERBOSE=1 BX_NAME=m3 BX_RESET=1 BX_MOUNTS="/x:/x" \
     BX_COMMAND="true" BX_STATE_DIR="$d/local" \
     FAKE_VMS="m3" PATH="${_fake_bin_dir}:$PATH" \
     "$_bx" 2>&1)"
@@ -178,7 +178,7 @@ test_lock_recovers_from_dead_holder() {
   d="$(_new_workdir)"
   mkdir -p "$d/local/m5.lock.d"
   printf '999999\n' >"$d/local/m5.lock.d/pid"
-  out="$(cd "$d" && BX_NAME=m5 BX_COMMAND="true" \
+  out="$(cd "$d" && BX_VERBOSE=1 BX_NAME=m5 BX_COMMAND="true" \
     BX_STATE_DIR="$d/local" PATH="${_fake_bin_dir}:$PATH" \
     "$_bx" 2>&1)"
   rc=$?
@@ -209,6 +209,89 @@ test_quiet_silences_notes_but_not_errors() {
   out="$(cd "$d" && BX_VERBOSE=0 PATH="${_fake_bin_dir}:$PATH" \
     "$_bx" --machine ghost nowhere 2>&1)"
   assert_contains "not defined" "$out" "errors survive --quiet"
+  rm -rf "$d"
+}
+
+# ── fidelity ────────────────────────────────────────────────────────────────
+test_piped_run_is_quiet() {
+  _current="a run with stderr not a tty emits no narration"
+  local d out
+  d="$(_new_workdir)"
+  # The fake reports no machine, so this run would normally say "creating".
+  # Captured stderr is not a tty, so run narration must be suppressed.
+  out="$(cd "$d" && BX_NAME=pipe BX_COMMAND="true" \
+    BX_STATE_DIR="$d/local" \
+    PATH="${_fake_bin_dir}:$PATH" \
+    "$_bx" 2>&1 >/dev/null)"
+  assert_not_contains "creating" "$out" "no create narration when piped"
+  assert_not_contains "bx:" "$out" "no bx-prefixed line when piped"
+  rm -rf "$d"
+}
+
+test_env_passthrough_is_curated() {
+  _current="only the curated host env is forwarded"
+  local d calls
+  d="$(_new_workdir)"
+  ( cd "$d" && TERM=xterm-fake LANG=en_US.UTF-8 TZ=UTC \
+      AWS_SECRET_ACCESS_KEY="BXSECRET_$RANDOM$RANDOM" EDITOR=ed \
+      BX_NAME=envf BX_COMMAND="true" BX_STATE_DIR="$d/local" \
+      PATH="${_fake_bin_dir}:$PATH" "$_bx" >/dev/null 2>&1 )
+  calls="$(cat "$_fake_log")"
+  assert_contains "--env TERM=xterm-fake" "$calls" "TERM forwarded"
+  assert_contains "--env LANG=en_US.UTF-8" "$calls" "LANG forwarded"
+  assert_not_contains "EDITOR=ed" "$calls" "non-allowlisted var dropped"
+  rm -rf "$d"
+}
+
+test_signal_reaches_foreground_job() {
+  _current="a signal to the foreground job reaches the guest exec"
+  local d sig started
+  d="$(_new_workdir)"
+  sig="$d/sig.txt"
+  started="$d/started.txt"
+  mkdir -p "$d/bin"
+  # A fake smolvm whose machine exec blocks until it is signalled, recording
+  # which signal it received. This exercises the signal path without a VM.
+  cat >"$d/bin/smolvm" <<FAKE
+#!/usr/bin/env bash
+sig=$(printf '%q' "$sig")
+started=$(printf '%q' "$started")
+case "\$1 \$2" in
+  "machine ls") ;;
+  "machine exec")
+    trap 'printf TERM >"\$sig"; exit 143' TERM
+    trap 'printf INT  >"\$sig"; exit 130' INT
+    : >"\$started"
+    while :; do sleep 0.1; done ;;
+  *) exit 0 ;;
+esac
+exit 0
+FAKE
+  chmod +x "$d/bin/smolvm"
+  printf '[f]\nimage = debian:bookworm-slim\nmounts = /tmp:/work\ncommand = sleep 9\n' \
+    >"$d/.bx.conf"
+  # Job control puts bx in its own process group, which is what a terminal
+  # does for the foreground job. A terminal's Ctrl-C/Term then goes to the
+  # whole group, so smolvm — running in the foreground of that group — gets it
+  # directly, with no forwarding needed. Signal the group, not just bx.
+  set -m
+  ( cd "$d" && exec env BX_NAME=sigf BX_STATE_DIR="$d/local" \
+      PATH="$d/bin:$PATH" "$_bx" f ) >/dev/null 2>&1 &
+  local bxpid=$!
+  set +m
+  local _tries=0
+  while [[ ! -f "$started" && "$_tries" -lt 50 ]]; do
+    sleep 0.1; _tries=$((_tries + 1))
+  done
+  kill -TERM -- "-$bxpid" 2>/dev/null || true
+  wait "$bxpid" 2>/dev/null || true
+  local got=""
+  _tries=0
+  while [[ ! -s "$sig" && "$_tries" -lt 20 ]]; do
+    sleep 0.1; _tries=$((_tries + 1))
+  done
+  [[ -s "$sig" ]] && got="$(cat "$sig")"
+  assert_eq "TERM" "$got" "TERM reached the guest exec"
   rm -rf "$d"
 }
 
@@ -753,7 +836,7 @@ test_secret_persisted_warns() {
   _current="a persisted secret produces a warning"
   local d out
   d="$(_new_workdir)"
-  out="$(cd "$d" && BX_NAME=sl4 BX_COMMAND="true" \
+  out="$(cd "$d" && BX_VERBOSE=1 BX_NAME=sl4 BX_COMMAND="true" \
     BX_SECRET_ENV="API_KEY=THE_KEY:persisted" \
     BX_STATE_DIR="$d/local" THE_KEY=x \
     PATH="${_fake_bin_dir}:$PATH" "$_bx" 2>&1)"
@@ -882,6 +965,9 @@ test_lock_blocks_live_holder
 test_lock_recovers_from_dead_holder
 test_quiet_silences_notes_but_not_errors
 test_verbose_shows_smolvm_commands
+test_piped_run_is_quiet
+test_env_passthrough_is_curated
+test_signal_reaches_foreground_job
 test_bootstrap_comment_does_not_end_value
 test_guest_exit_status_propagates
 test_empty_input_does_not_abort
