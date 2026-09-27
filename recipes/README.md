@@ -115,7 +115,7 @@ Every `bx` setting is a recipe key:
 | `image` | guest image (a container image when `backend = podman`) |
 | `name` | machine name |
 | `cpus` / `mem` | vCPUs / MiB |
-| `net` | enable networking |
+| `net` | network mode: `none`, `bridge` (runtime NAT, default), or `host` (share the runtime's namespace). `1`/`0` still mean `bridge`/`none` |
 | `mounts` | `HOST:GUEST` pairs (repeatable) |
 | `workdir` | guest directory to run in |
 | `keep` / `reset` | lifecycle flags |

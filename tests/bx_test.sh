@@ -133,7 +133,7 @@ test_conflict_on_changed_mounts() {
 image=debian:bookworm-slim
 cpus=4
 mem=4096
-net=1
+net=bridge
 mounts:
 /only:/only
 STATE
@@ -157,7 +157,7 @@ test_reuse_on_unchanged_shape() {
 image=debian:bookworm-slim
 cpus=4
 mem=4096
-net=1
+net=bridge
 mounts:
 /only:/only
 STATE
@@ -404,7 +404,7 @@ test_cpu_change_conflicts() {
 image=debian:bookworm-slim
 cpus=4
 mem=4096
-net=1
+net=bridge
 mounts:
 /a:/a
 STATE
@@ -948,7 +948,7 @@ test_status_lists_a_machine() {
 image=debian:bookworm-slim
 cpus=4
 mem=4096
-net=1
+net=bridge
 mounts:
 $d:/work
 secret_lifetimes:
@@ -1024,7 +1024,7 @@ test_old_state_file_still_reuses() {
 image=debian:bookworm-slim
 cpus=4
 mem=4096
-net=1
+net=bridge
 mounts:
 /only:/only
 STATE
@@ -1076,7 +1076,7 @@ test_backend_is_part_of_the_shape() {
 image=debian:bookworm-slim
 cpus=4
 mem=4096
-net=1
+net=bridge
 backend=podman
 mounts:
 /only:/only
@@ -1158,7 +1158,6 @@ CONF
   assert_not_contains "not interactive" "$out" "did not ask"
   rm -rf "$d"
 }
-
 
 # A secret crosses by name on both backends: podman has no --secret-env, so bx
 # uses `-e GUEST` and exports the host variable. The value must never appear in
@@ -1309,6 +1308,253 @@ test_explicit_backend_never_prompts
 test_container_backend_secret_stays_out_of_argv
 test_dry_run_reports_backend
 test_unknown_backend_is_rejected
+
+# `net` is a mode, not a flag, and each mode has to reach the runtime as the
+# right flag. `none`/`bridge`/`host` are the vocabulary; `0`/`1` are kept as
+# aliases for the modes they always meant.
+test_net_modes_reach_the_container() {
+  _current="net modes reach podman as the right flag"
+  local d calls
+  : >"$_fake_podman_log"
+  d="$(_new_workdir)"
+  cat >"$d/.bx.conf" <<'CONF'
+[ctr]
+backend = podman
+image   = debian:bookworm-slim
+net     = host
+mounts  = /only:/only
+command = true
+CONF
+  (cd "$d" && BX_NAME=nethost BX_STATE_DIR="$d/local" \
+    PATH="${_fake_podman_dir}:/usr/bin:/bin" "$_bx" ctr >/dev/null 2>&1)
+  calls="$(cat "$_fake_podman_log" 2>/dev/null)"
+  assert_contains "--network=host" "$calls" "host mode shares the namespace"
+  rm -rf "$d"
+
+  : >"$_fake_podman_log"
+  d="$(_new_workdir)"
+  cat >"$d/.bx.conf" <<'CONF'
+[ctr]
+backend = podman
+image   = debian:bookworm-slim
+net     = none
+mounts  = /only:/only
+command = true
+CONF
+  (cd "$d" && BX_NAME=netnone BX_STATE_DIR="$d/local" \
+    PATH="${_fake_podman_dir}:/usr/bin:/bin" "$_bx" ctr >/dev/null 2>&1)
+  calls="$(cat "$_fake_podman_log" 2>/dev/null)"
+  assert_contains "--network=none" "$calls" "none mode cuts the network"
+  rm -rf "$d"
+}
+
+# The legacy boolean still means what it always did: 1 is the runtime bridge,
+# 0 is no network. A recipe written before modes existed keeps working.
+test_net_boolean_still_means_a_mode() {
+  _current="net = 1/0 stay aliases for bridge/none"
+  local d out
+  d="$(_new_workdir)"
+  cat >"$d/.bx.conf" <<'CONF'
+[ctr]
+backend = podman
+image   = debian:bookworm-slim
+net     = 1
+mounts  = /only:/only
+command = true
+CONF
+  out="$(cd "$d" && BX_NESTED_NET=normal BX_NAME=netbool \
+    BX_STATE_DIR="$d/local" \
+    PATH="${_fake_podman_dir}:/usr/bin:/bin" "$_bx" --dry-run ctr 2>&1)"
+  assert_contains "net=bridge" "$out" "1 is bridge"
+
+  cat >"$d/.bx.conf" <<'CONF'
+[ctr]
+backend = podman
+image   = debian:bookworm-slim
+net     = 0
+mounts  = /only:/only
+command = true
+CONF
+  out="$(cd "$d" && BX_NAME=netbool BX_STATE_DIR="$d/local" \
+    PATH="${_fake_podman_dir}:/usr/bin:/bin" "$_bx" --dry-run ctr 2>&1)"
+  assert_contains "net=none" "$out" "0 is none"
+  rm -rf "$d"
+}
+
+# A mode that is not a mode is a hard error, not a silent default.
+test_net_bogus_mode_is_rejected() {
+  _current="an unknown net mode is rejected"
+  local d out
+  d="$(_new_workdir)"
+  out="$(cd "$d" && BX_NET=bogus BX_COMMAND=true BX_MOUNTS="/a:/a" \
+    BX_STATE_DIR="$d/local" PATH="${_fake_bin_dir}:$PATH" \
+    "$_bx" 2>&1)"
+  assert_contains "not a mode" "$out" "names the problem"
+  assert_contains "none, bridge, or host" "$out" "names the vocabulary"
+  rm -rf "$d"
+}
+
+# The mode is part of the shape, so changing it forces a recreate rather than
+# silently moving a machine onto a different network.
+test_net_mode_is_part_of_the_shape() {
+  _current="changing net is a shape change"
+  local d out
+  d="$(_new_workdir)"
+  cat >"$d/local/nshape.state" <<'STATE'
+image=debian:bookworm-slim
+cpus=4
+mem=4096
+net=none
+backend=podman
+mounts:
+/only:/only
+STATE
+  cat >"$d/.bx.conf" <<'CONF'
+[ctr]
+backend = podman
+image   = debian:bookworm-slim
+net     = host
+mounts  = /only:/only
+command = true
+CONF
+  out="$(cd "$d" && FAKE_CONTAINERS=nshape BX_NAME=nshape \
+    BX_MOUNTS="/only:/only" BX_NET=host \
+    BX_COMMAND=true BX_STATE_DIR="$d/local" \
+    PATH="${_fake_podman_dir}:/usr/bin:/bin" "$_bx" ctr 2>&1)"
+  assert_contains "different shape" "$out" "a net change is a conflict"
+  assert_contains "--reset" "$out" "names the fix"
+  rm -rf "$d"
+}
+
+# A container on the runtime bridge cannot reach the network inside a vm with
+# user-mode (TSI) networking. When the recipe *asks* for a bridge there, bx
+# refuses and names the fix, rather than creating a container whose DNS fails.
+test_net_bridge_under_tsi_is_refused() {
+  _current="net = bridge is refused, with the fix, under TSI"
+  local d out calls
+  : >"$_fake_podman_log"
+  d="$(_new_workdir)"
+  cat >"$d/.bx.conf" <<'CONF'
+[ctr]
+backend = podman
+image   = debian:bookworm-slim
+net     = bridge
+mounts  = /only:/only
+command = true
+CONF
+  out="$(cd "$d" && BX_NESTED_NET=tsi BX_NAME=tsibr BX_STATE_DIR="$d/local" \
+    PATH="${_fake_podman_dir}:/usr/bin:/bin" "$_bx" ctr 2>&1)"
+  calls="$(cat "$_fake_podman_log" 2>/dev/null)"
+  assert_contains "net = host" "$out" "names the recommended fix"
+  assert_contains "net = none" "$out" "offers the no-network option"
+  assert_not_contains "create --name" "$calls" "does not create a broken container"
+  rm -rf "$d"
+}
+
+# When nothing was asked for, the mode that works is used, and bx says so.
+# Unset means "whatever works", so this is a report, not a silent override.
+test_net_unset_under_tsi_uses_host() {
+  _current="net unset under TSI uses host and says so"
+  local d out calls
+  : >"$_fake_podman_log"
+  d="$(_new_workdir)"
+  cat >"$d/.bx.conf" <<'CONF'
+[ctr]
+backend = podman
+image   = debian:bookworm-slim
+mounts  = /only:/only
+command = true
+CONF
+  out="$(cd "$d" && BX_VERBOSE=1 BX_NESTED_NET=tsi BX_NAME=tsiauto \
+    BX_STATE_DIR="$d/local" PATH="${_fake_podman_dir}:/usr/bin:/bin" \
+    "$_bx" ctr 2>&1)"
+  calls="$(cat "$_fake_podman_log" 2>/dev/null)"
+  assert_contains "--network=host" "$calls" "falls back to host networking"
+  assert_contains "user-mode" "$out" "explains why"
+  rm -rf "$d"
+}
+
+# Approval is explicit: BX_NET_APPROVED=1 turns an asked-for bridge into host
+# for this run, without editing the recipe.
+test_net_bridge_approved_becomes_host() {
+  _current="BX_NET_APPROVED=1 approves host networking"
+  local d calls
+  : >"$_fake_podman_log"
+  d="$(_new_workdir)"
+  cat >"$d/.bx.conf" <<'CONF'
+[ctr]
+backend = podman
+image   = debian:bookworm-slim
+net     = bridge
+mounts  = /only:/only
+command = true
+CONF
+  (cd "$d" && BX_NESTED_NET=tsi BX_NET_APPROVED=1 BX_NAME=tsiappr \
+    BX_STATE_DIR="$d/local" PATH="${_fake_podman_dir}:/usr/bin:/bin" \
+    "$_bx" ctr >/dev/null 2>&1)
+  calls="$(cat "$_fake_podman_log" 2>/dev/null)"
+  assert_contains "--network=host" "$calls" "approval becomes host networking"
+  rm -rf "$d"
+}
+
+# On an ordinary host the bridge is correct and must be left alone.
+test_net_bridge_kept_on_a_normal_host() {
+  _current="net = bridge is kept on a normal host"
+  local d calls
+  : >"$_fake_podman_log"
+  d="$(_new_workdir)"
+  cat >"$d/.bx.conf" <<'CONF'
+[ctr]
+backend = podman
+image   = debian:bookworm-slim
+net     = bridge
+mounts  = /only:/only
+command = true
+CONF
+  (cd "$d" && BX_NESTED_NET=normal BX_NAME=normbr BX_STATE_DIR="$d/local" \
+    PATH="${_fake_podman_dir}:/usr/bin:/bin" "$_bx" ctr >/dev/null 2>&1)
+  calls="$(cat "$_fake_podman_log" 2>/dev/null)"
+  assert_not_contains "--network=host" "$calls" "does not force host on a host"
+  assert_not_contains "--network=none" "$calls" "does not cut the network"
+  rm -rf "$d"
+}
+
+# The same modes, on the vm backend. smolvm enables the vm's own network with
+# `--net`; `none` omits it, and `host` (a vm's network is already host-like)
+# also needs it. `bridge` is the vm's own NAT and is the same as `host` here.
+test_net_modes_reach_the_vm() {
+  _current="net modes reach smolvm as the right flag"
+  local d calls
+  d="$(_new_workdir)"
+  : >"$_fake_log"
+  (cd "$d" && BX_NESTED_NET=normal BX_NET=none BX_NAME=vmnone \
+    BX_MOUNTS="/only:/only" BX_COMMAND=true BX_STATE_DIR="$d/local" \
+    FAKE_VMS="" PATH="${_fake_bin_dir}:$PATH" "$_bx" >/dev/null 2>&1)
+  calls="$(cat "$_fake_log" 2>/dev/null)"
+  assert_not_contains "--net" "$calls" "none does not enable the vm network"
+  rm -rf "$d"
+
+  d="$(_new_workdir)"
+  : >"$_fake_log"
+  (cd "$d" && BX_NESTED_NET=normal BX_NET=host BX_NAME=vmhost \
+    BX_MOUNTS="/only:/only" BX_COMMAND=true BX_STATE_DIR="$d/local" \
+    FAKE_VMS="" PATH="${_fake_bin_dir}:$PATH" "$_bx" >/dev/null 2>&1)
+  calls="$(cat "$_fake_log" 2>/dev/null)"
+  assert_contains "--net" "$calls" "host enables the vm network"
+  rm -rf "$d"
+}
+
+test_net_modes_reach_the_container
+test_net_boolean_still_means_a_mode
+test_net_bogus_mode_is_rejected
+test_net_mode_is_part_of_the_shape
+test_net_bridge_under_tsi_is_refused
+test_net_unset_under_tsi_uses_host
+test_net_bridge_approved_becomes_host
+test_net_bridge_kept_on_a_normal_host
+test_net_modes_reach_the_vm
+
+
 
 # The engine is only unified if every backend implements the same verbs. A new
 # backend that forgets one would fail at the call site, deep in a run; catch it

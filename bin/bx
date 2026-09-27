@@ -55,6 +55,12 @@
 # forces the question even when only one is available. A run that cannot answer
 # the question (no terminal) is an error naming both choices, never a silent
 # pick; `--dry-run` reports the choice a run would make.
+#
+# `net` is the network mode: `none`, `bridge` (the runtime's own NAT, default),
+# or `host` (share the runtime's network namespace). It is part of the shape. A
+# container on `bridge` cannot reach the network inside a vm with user-mode
+# (krun/TSI) networking, so that combination is refused with the fix: set
+# `net = host`, which is the explicit approval to share the guest's namespace.
 # `mounts`, `bootstrap_env`, and `secret_env` may repeat; their lines are kept
 # in order. `#` starts a comment; values run to end of line after trimming. A
 # value continues on following lines if those lines are indented.
@@ -340,7 +346,12 @@ _machine_exists() {
 #   mounts   smolvm binds a host directory into the vm (`--volume H:G`);
 #            podman bind-mounts it (`-v H:G`). Same pair grammar.
 #   net      smolvm needs `--net` to enable it; a container is on the default
-#            bridge unless told `--network=none`.
+#            bridge unless told `--network=none`. `net` is a mode, not a flag:
+#            `none`, `bridge` (the runtime's own NAT), or `host` (share the
+#            runtime's network namespace). `host` is what makes a container
+#            work inside a bx vm, whose user-mode (TSI) network cannot forward
+#            a container bridge's NAT; bx refuses the impossible combination
+#            rather than letting DNS fail at run time. See `_net_guard`.
 #   secrets  smolvm takes `--secret-env GUEST=HOST`; a container takes
 #            `-e GUEST`, inheriting the value from the exec's environment,
 #            which bx sets from the host variable by name. Either way the
@@ -401,7 +412,7 @@ bk_smolvm_secret_export() { printf '0'; }
 # `_vm_mem`, `_net`, `_want_mounts`; writes `_create_args`.
 bk_smolvm_create_args() {
   _create_args=(--name "$_vm_name" --image "$_image" --cpus "$_vm_cpus" --mem "$_vm_mem")
-  [[ "$_net" == "1" ]] && _create_args+=(--net)
+  [[ "$_net" == "none" ]] || _create_args+=(--net)
   local _mount
   while IFS= read -r _mount; do
     [[ -n "$_mount" ]] || continue
@@ -498,7 +509,11 @@ bk_podman_secret_export() { printf '1'; }
 # `podman stop`. `--entrypoint ''` plus `sleep infinity` gives exactly that.
 bk_podman_create_args() {
   _create_args=(--name "$_vm_name" --cpus "$_vm_cpus" --memory "${_vm_mem}m")
-  [[ "$_net" == "0" ]] && _create_args+=(--network=none)
+  case "$_net" in
+    none)   _create_args+=(--network=none) ;;
+    host)   _create_args+=(--network=host) ;;
+    bridge) ;;  # the runtime default; no flag needed
+  esac
   local _mount
   while IFS= read -r _mount; do
     [[ -n "$_mount" ]] || continue
@@ -1207,7 +1222,14 @@ _dump_recipe() {
   printf 'name=%s\n' "${BX_NAME:-bx}"
   printf 'cpus=%s\n' "${BX_CPUS:-4}"
   printf 'mem=%s\n' "${BX_MEM:-4096}"
-  printf 'net=%s\n' "${BX_NET:-1}"
+  # Show `net` as the mode it means, not the raw flag, without running the
+  # guard: `--show` must not fail on a config that a real run would refuse.
+  case "${BX_NET:-1}" in
+    0|none)   printf 'net=none\n' ;;
+    1|bridge) printf 'net=bridge\n' ;;
+    host)     printf 'net=host\n' ;;
+    *)        printf 'net=%s (invalid)\n' "$BX_NET" ;;
+  esac
   printf 'workdir=%s\n' "${BX_WORKDIR:-(none)}"
   printf 'keep=%s\n' "${BX_KEEP:-0}"
   printf 'reset=%s\n' "${BX_RESET:-0}"
@@ -1517,6 +1539,7 @@ _workdir="${BX_WORKDIR:-}"
 _command="${BX_COMMAND:-}"
 _dry_run="${BX_DRY_RUN:-0}"
 _no_lock="${BX_NO_LOCK:-0}"
+_net_approved="${BX_NET_APPROVED:-0}"
 
 if [[ -z "$_command" ]]; then
   if [[ -n "${_recipe:-}" ]] && _has_recipe "$_recipe"; then
@@ -1545,6 +1568,90 @@ _lock_dir="${_state_dir}/${_vm_name}.lock.d"
 # the choice is made here so that `--status`, `--gc`, `--show`, and `--new`
 # never prompt and never need a runtime installed.
 _choose_backend
+
+# ── networking, as an approved capability ──────────────────────────────────
+# `net` is a mode, not a flag. It is normalized here, once, and it enters the
+# shape in its normalized form, so a machine records `host` rather than `1` and
+# a change of mode is a shape change like any other.
+#
+#   0 / none    no network at all
+#   1 / bridge  the runtime's own NAT (the default)
+#   host        share the runtime's network namespace
+#
+# The three modes are not interchangeable, and the one that works depends on
+# where bx is running. A container on the runtime bridge cannot reach the
+# network when bx itself is inside a vm whose networking is user-mode (krun's
+# TSI hijack, visible as `tsi_hijack` in /proc/cmdline). TSI intercepts the
+# guest's *own* sockets; it does not forward a container bridge's NAT, so DNS
+# inside the container simply fails. Only `host` works there.
+#
+# So `net` has two states, and they are treated differently on purpose:
+#
+#   unset  the user did not ask for anything; bx picks the mode that works in
+#          this environment (`host` under TSI, `bridge` otherwise) and says so.
+#          Unset means "whatever works", so this is not a guess.
+#   set    the user asked for a specific mode. If it is `bridge` under TSI,
+#          that cannot work: bx refuses and names the fix rather than silently
+#          overriding a stated choice. Naming `net = host` in the recipe is the
+#          approval to share the guest's namespace; `BX_NET_APPROVED=1` is the
+#          same approval for one run.
+_net_explicit=0
+[[ -n "${BX_NET:-}" ]] && _net_explicit=1
+
+_normalize_net() {
+  case "$_net" in
+    0|none)   _net="none" ;;
+    1|bridge) _net="bridge" ;;
+    host)    _net="host" ;;
+    *) _die "net='$_net' is not a mode; use none, bridge, or host" ;;
+  esac
+}
+
+# Is this vm's networking user-mode (TSI), which cannot forward a container
+# bridge? The marker is in the kernel command line smolvm boots with. The
+# answer can be forced with BX_NESTED_NET=tsi|normal, so the behavior is
+# testable (and debuggable) on a host whose /proc/cmdline cannot be changed.
+_guest_is_tsi() {
+  case "${BX_NESTED_NET:-}" in
+    tsi)    return 0 ;;
+    normal) return 1 ;;
+  esac
+  [[ -r /proc/cmdline ]] && grep -qw 'tsi_hijack' /proc/cmdline
+}
+
+# Decide the network mode, refusing only a choice that cannot work. `--dry-run`
+# goes through here too: a plan that cannot run is not a plan, and finding out
+# at create time instead of exec time is the difference this guard buys.
+_net_guard() {
+  # Only a container on the runtime bridge is affected; a vm has its own net.
+  [[ "$_backend" == "podman" && "$_net" == "bridge" ]] || return 0
+  _guest_is_tsi || return 0
+
+  if [[ "$_net_approved" == "1" ]]; then
+    # Approval to reach the network by sharing the guest's namespace.
+    _net="host"
+    return 0
+  fi
+  if [[ "$_net_explicit" == "0" ]]; then
+    # Nothing was asked for. `bridge` cannot work here, so use `host` and say
+    # so once: this is the documented preference for a nested bx, not a guess.
+    _net="host"
+    _run_note "container networking: using 'host' (this machine's network is user-mode; a bridge cannot route through it). Set net = bridge to be told instead, or net = none for no network."
+    return 0
+  fi
+  _die "net = bridge cannot work here: bx is running inside a machine with
+user-mode networking (krun/TSI), which cannot forward a container bridge, so
+DNS and egress would fail at run time.
+
+Two ways forward:
+  net = host     share this machine's network (recommended in a nested bx)
+  net = none     no network, if the command does not need it
+
+Change it in the recipe, or run with BX_NET=host."
+}
+
+_normalize_net
+_net_guard
 
 
 # The recorded shape, or empty when this name has never been created here.

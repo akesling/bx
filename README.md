@@ -264,6 +264,49 @@ choose. To settle the question once and for all, name it in the recipe
 (`backend = podman`) or the environment (`BX_BACKEND=podman`), and bx will not
 ask again.
 
+#### Networking, when the container is nested
+
+A container on the ordinary `bridge` network cannot reach the internet when bx
+is itself inside a vm whose networking is user-mode — which is the case for the
+`pi_agent` guest, whose kernel boots with krun's TSI hijack (`tsi_hijack` in
+`/proc/cmdline`). TSI intercepts the guest's *own* sockets; it does not forward
+a container bridge's NAT, so DNS inside the container simply fails.
+
+The fix is to share the guest's network namespace, and bx will not do that
+behind your back:
+
+```ini
+[browser-test]
+backend = podman
+net     = host          # share this machine's network namespace
+```
+
+`net` is a mode — `none`, `bridge` (the default), or `host` — not a boolean,
+because the difference between them is what a container can reach. The two
+ways to get a `net` value are deliberately different:
+
+- **Unset.** You did not ask for anything, so bx uses the mode that works here:
+  `host` under TSI, `bridge` otherwise. It says so once, and the recorded shape
+  keeps the mode it actually used. "Whatever works" is not a guess.
+- **Set.** You asked for a specific mode. If that mode cannot work — `bridge`
+  in a nested guest — bx refuses at *create* time with the exact change to
+  make, rather than silently overriding your stated choice:
+
+```
+bx: net = bridge cannot work here: bx is running inside a machine with
+user-mode networking (krun/TSI), which cannot forward a container bridge, so
+DNS and egress would fail at run time.
+
+Two ways forward:
+  net = host     share this machine's network (recommended in a nested bx)
+  net = none     no network, if the command does not need it
+```
+
+Naming `net = host` in the recipe is the approval, and it also works for every
+non-nested case. `BX_NET_APPROVED=1` grants the same approval for one run
+without editing the recipe. `net = host` widens the container's reach, so it is
+a deliberate choice, the same way naming a backend is.
+
 What this does not do (yet): podman can run many containers under one name and
 bx does not model a *group* of them; volumes are bind mounts, not podman
 volumes; and `--status`/`--gc` read only the containers bx itself created. A
@@ -459,7 +502,8 @@ a key is read from the environment, as a recipe key, or both; `profile`,
 | `BX_IMAGE` | both | `debian:bookworm-slim` | guest image (a container image when `backend = podman`) |
 | `BX_NAME` | both | `bx` | machine name |
 | `BX_CPUS` / `BX_MEM` | both | `4` / `4096` | vCPUs / MiB |
-| `BX_NET` | both | `1` | enable networking |
+| `BX_NET` | both | `bridge` | network mode: `none`, `bridge`, or `host`; `1`/`0` mean `bridge`/`none`. Unset, bx picks `host` in a nested (TSI) guest, since a bridge cannot route there |
+| `BX_NET_APPROVED` | env | `0` | `1` approves switching a nested container to `host` networking without editing the recipe |
 | `BX_BACKEND` | both | — | the runtime that owns the machine: `smolvm` (a microVM) or `podman` (a container). Unset, bx uses the only one installed, and asks when both are (see below) |
 | `BX_BACKEND_PROMPT` | both | `0` | `1` to be asked for the backend even when only one is installed |
 | `BX_MOUNTS` | both | — | newline-separated `HOST:GUEST` pairs |

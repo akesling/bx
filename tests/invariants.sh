@@ -335,6 +335,31 @@ test_backend_choice_is_documented() {
   _pass
 }
 
+# `net` is a capability the user approves, not a knob bx turns silently. The
+# documentation must keep saying that an explicit `bridge` under user-mode
+# networking is refused with the fix, and that an unset `net` picks what works.
+test_net_mode_choice_is_documented() {
+  _current="the net modes and their approval rule are documented"
+  local _readme="${_repo_root}/README.md"
+  if ! grep -qF 'net = host' "$_readme"; then
+    _fail "README no longer documents the host network mode"
+    return
+  fi
+  if ! grep -qiE 'user-mode|TSI' "$_readme"; then
+    _fail "README no longer explains why a bridge cannot work when nested"
+    return
+  fi
+  if ! grep -qiF 'refuses at *create* time' "$_readme"; then
+    _fail "README no longer says an impossible net choice is refused, not silently changed"
+    return
+  fi
+  if ! grep -qiE 'did not ask for anything|Whatever works|uses the mode that works' "$_readme"; then
+    _fail "README no longer says an unset net picks the mode that works"
+    return
+  fi
+  _pass
+}
+
 # ── real: isolation, only when asked ────────────────────────────────────────
 # This is the claim the README leads with: the host home directory is not
 # mounted. It cannot be tested with a fake smolvm, so it is opt-in.
@@ -377,6 +402,7 @@ test_dry_run_needs_no_smolvm
 test_boot_probe_accepts_macos
 test_containers_claim_is_documented
 test_backend_choice_is_documented
+test_net_mode_choice_is_documented
 
 if [[ "${BX_REAL:-0}" == "1" ]]; then
   # Use the shipping predicate, not a copy: a bare /dev/kvm check would skip
