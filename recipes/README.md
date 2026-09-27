@@ -87,7 +87,7 @@ command = go test ./...
 
 Shape keys are the machine's identity, image, resources, mounts, and setup:
 `name`, `image`, `cpus`, `mem`, `net`, `mounts`, `workdir`, `bootstrap`,
-`bootstrap_env`, `secret_env`, `pre_command`, `state_dir`.
+`bootstrap_env`, `secret_env`, `pre_command`, `state_dir`, `backend`.
 
 ## A command recipe
 
@@ -112,7 +112,7 @@ Every `bx` setting is a recipe key:
 | --- | --- |
 | `command` | shell to run in the guest (what makes a command recipe) |
 | `machine` | the machine recipe this command runs on |
-| `image` | guest image |
+| `image` | guest image (a container image when `backend = podman`) |
 | `name` | machine name |
 | `cpus` / `mem` | vCPUs / MiB |
 | `net` | enable networking |
@@ -124,6 +124,7 @@ Every `bx` setting is a recipe key:
 | `secret_env` | `GUEST=HOSTVAR[:LIFETIME]`, passed by name (repeatable) |
 | `pre_command` | host shell run after start, before the bootstrap |
 | `state_dir` | where the lock and recorded shape live |
+| `backend` | the runtime that owns the machine: `smolvm` (a microVM, the default) or `podman` (a container). Use `podman` from inside a machine, where a vm cannot boot. Part of the shape: changing it forces `--reset`. If omitted, `smolvm` is used when it is on `PATH`, otherwise `podman` if present, and bx says which it chose. |
 | `extends` | inherit from another recipe (see **Composition**) |
 | `resolve` | run a resolver before merging this recipe (see **Resolvers**) |
 

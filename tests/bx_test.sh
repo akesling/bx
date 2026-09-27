@@ -56,6 +56,35 @@ FAKE
 }
 _remove_fake_smolvm() { rm -rf "$_fake_bin_dir"; }
 
+# A fake podman, the same shape of thing: it records invocations and answers
+# the query surface the container backend uses. `ps -a --format` reports the
+# names in FAKE_CONTAINERS. This is what lets the container backend be tested
+# on the host, with no podman, no container, and no network.
+_fake_podman_dir=""
+_install_fake_podman() {
+  _fake_podman_dir="$(mktemp -d)"
+  _fake_podman_log="${_fake_podman_dir}/calls.log"
+  : >"$_fake_podman_log"
+  cat >"${_fake_podman_dir}/podman" <<FAKE
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$(printf '%q' "$_fake_podman_log")"
+case "\$1" in
+  ps)
+    for _n in \${FAKE_CONTAINERS:-}; do printf '%s\n' "\$_n"; done
+    ;;
+  image)
+    [[ "\${FAKE_IMAGE_CACHED:-0}" == "1" ]] && exit 0 || exit 1
+    ;;
+  exec)
+    exit "\${FAKE_EXEC_RC:-0}"
+    ;;
+esac
+exit 0
+FAKE
+  chmod +x "${_fake_podman_dir}/podman"
+}
+_remove_fake_podman() { rm -rf "$_fake_podman_dir"; }
+
 _new_workdir() {
   local d
   d="$(mktemp -d)"
@@ -1001,8 +1030,162 @@ STATE
   rm -rf "$d"
 }
 
+# ── the container backend ───────────────────────────────────────────────────
+# bx inside a machine cannot boot a machine, but it can run a container. These
+# pin that the same lifecycle verbs reach podman, that the shape records which
+# backend owns it, and that the two backends are never silently interchanged.
+_install_fake_podman
+
+# A machine recipe that chooses the container backend, run with the fake
+# podman on PATH and a fresh state dir.
+test_container_backend_creates_and_execs() {
+  _current="backend=podman creates a container and execs into it"
+  local d out calls
+  d="$(_new_workdir)"
+  cat >"$d/.bx.conf" <<'CONF'
+[ctr]
+backend = podman
+image   = debian:bookworm-slim
+mounts  = /only:/only
+command = true
+CONF
+  out="$(cd "$d" && BX_NAME=ctrinv BX_STATE_DIR="$d/local" \
+    PATH="${_fake_podman_dir}:$PATH" "$_bx" ctr 2>&1)"
+  calls="$(cat "$_fake_podman_log" 2>/dev/null)"
+  assert_contains "create --name ctrinv" "$calls" "creates a container"
+  assert_contains "-v /only:/only" "$calls" "bind-mounts the mount"
+  assert_contains "start ctrinv" "$calls" "starts it"
+  assert_contains "exec" "$calls" "execs the command"
+  assert_contains "stop ctrinv" "$calls" "stops it on the way out"
+  rm -rf "$d"
+}
+
+# The shape records the backend, so a machine built as a vm is never reused as
+# a container (or vice versa): the runtime that owns the mounts is different.
+test_backend_is_part_of_the_shape() {
+  _current="changing backend is a shape change, and refuses to reuse"
+  local d out
+  d="$(_new_workdir)"
+  cat >"$d/local/bmix.state" <<'STATE'
+image=debian:bookworm-slim
+cpus=4
+mem=4096
+net=1
+backend=podman
+mounts:
+/only:/only
+STATE
+  out="$(cd "$d" && BX_NAME=bmix BX_MOUNTS="/only:/only" \
+    BX_COMMAND="true" BX_STATE_DIR="$d/local" FAKE_VMS="bmix" \
+    PATH="${_fake_bin_dir}:$PATH" "$_bx" 2>&1)"
+  assert_contains "different shape" "$out" "refuses the wrong backend"
+  assert_contains "backend=podman" "$out" "shows what was recorded"
+  assert_contains "--reset" "$out" "names the fix"
+  rm -rf "$d"
+}
+
+# A recipe that says nothing gets smolvm when smolvm is present, even if
+# podman is too. The backend is only inferred when there is no choice.
+test_backend_prefers_smolvm_when_present() {
+  _current="a recipe with no backend uses smolvm when smolvm is on PATH"
+  local d calls
+  d="$(_new_workdir)"
+  : >"$_fake_podman_log"
+  (cd "$d" && BX_NAME=prefinv BX_MOUNTS="/only:/only" \
+    BX_COMMAND="true" BX_STATE_DIR="$d/local" FAKE_VMS= \
+    PATH="${_fake_bin_dir}:${_fake_podman_dir}:$PATH" "$_bx" >/dev/null 2>&1)
+  calls="$(cat "$_fake_podman_log" 2>/dev/null)"
+  assert_eq "" "$calls" "no podman was invoked"
+  rm -rf "$d"
+}
+
+# Inside a machine there is no smolvm and podman is present: the backend is
+# inferred, used, and *said* — never a silent substitution.
+test_backend_infers_podman_without_smolvm() {
+  _current="with no smolvm but podman, the container backend is chosen and named"
+  local d out calls
+  d="$(_new_workdir)"
+  : >"$_fake_podman_log"
+  out="$(cd "$d" && BX_VERBOSE=1 BX_NAME=infonly BX_MOUNTS="/only:/only" \
+    BX_COMMAND="true" BX_STATE_DIR="$d/local" \
+    PATH="${_fake_podman_dir}:/usr/bin:/bin" "$_bx" 2>&1)"
+  calls="$(cat "$_fake_podman_log" 2>/dev/null)"
+  assert_contains "using backend 'podman'" "$out" "says which backend it chose"
+  assert_contains "exec" "$calls" "runs through podman"
+  rm -rf "$d"
+}
+
+# A secret crosses by name on both backends: podman has no --secret-env, so bx
+# uses `-e GUEST` and exports the host variable. The value must never appear in
+# argv, which is the invariant the whole secret design rests on.
+test_container_backend_secret_stays_out_of_argv() {
+  _current="a container secret is passed by name, never in podman argv"
+  local d calls sentinel
+  d="$(_new_workdir)"
+  sentinel="SENTINEL-ctr-$$-secret"
+  : >"$_fake_podman_log"
+  cat >"$d/.bx.conf" <<'CONF'
+[sec]
+backend    = podman
+image      = debian:bookworm-slim
+mounts     = /only:/only
+secret_env = API_KEY=THE_SECRET_VAR:ephemeral
+command    = true
+CONF
+  (cd "$d" && THE_SECRET_VAR="$sentinel" BX_NAME=secctr BX_STATE_DIR="$d/local" \
+    PATH="${_fake_podman_dir}:/usr/bin:/bin" "$_bx" sec >/dev/null 2>&1)
+  calls="$(cat "$_fake_podman_log" 2>/dev/null)"
+  assert_contains "-e API_KEY" "$calls" "passes the guest name through"
+  assert_not_contains "$sentinel" "$calls" "the value never reached argv"
+  rm -rf "$d"
+}
+
+# --dry-run must plan for the backend without invoking it, the same promise it
+# makes for smolvm. A plan is inspectable on a host that cannot run either.
+test_dry_run_reports_backend() {
+  _current="--dry-run prints the backend and does not invoke it"
+  local d out calls
+  d="$(_new_workdir)"
+  : >"$_fake_podman_log"
+  cat >"$d/.bx.conf" <<'CONF'
+[ctr]
+backend = podman
+image   = debian:bookworm-slim
+mounts  = /only:/only
+command = true
+CONF
+  out="$(cd "$d" && BX_DRY_RUN=1 BX_NAME=dryctr BX_STATE_DIR="$d/local" \
+    PATH="${_fake_podman_dir}:/usr/bin:/bin" "$_bx" ctr 2>&1)"
+  calls="$(cat "$_fake_podman_log" 2>/dev/null)"
+  assert_contains "backend=podman" "$out" "plans for the container backend"
+  # Querying is not acting: dry-run may ask whether a machine or image exists,
+  # but it must never create, start, stop, or exec.
+  assert_not_contains "create --name" "$calls" "does not create"
+  assert_not_contains "exec" "$calls" "does not exec"
+  rm -rf "$d"
+}
+
+# An unknown backend is a hard error, not a silent fall back to smolvm.
+test_unknown_backend_is_rejected() {
+  _current="an unknown backend is rejected, not silently defaulted"
+  local d out
+  d="$(_new_workdir)"
+  cat >"$d/.bx.conf" <<'CONF'
+[bad]
+backend = docker
+image   = debian:bookworm-slim
+mounts  = /only:/only
+command = true
+CONF
+  out="$(cd "$d" && BX_NAME=badinv BX_STATE_DIR="$d/local" \
+    PATH="${_fake_bin_dir}:$PATH" "$_bx" bad 2>&1)"
+  assert_contains "unknown backend 'docker'" "$out" "names the bad backend"
+  assert_contains "smolvm" "$out" "says what was expected"
+  rm -rf "$d"
+}
+
 _install_fake_smolvm
-trap '_remove_fake_smolvm' EXIT
+trap '_remove_fake_smolvm; _remove_fake_podman' EXIT
 
 test_dry_run_plan
 test_conflict_on_changed_mounts
@@ -1060,6 +1243,13 @@ test_status_marks_orphan
 test_gc_previews_then_deletes
 test_gc_keeps_live_machine
 test_old_state_file_still_reuses
+test_container_backend_creates_and_execs
+test_backend_is_part_of_the_shape
+test_backend_prefers_smolvm_when_present
+test_backend_infers_podman_without_smolvm
+test_container_backend_secret_stays_out_of_argv
+test_dry_run_reports_backend
+test_unknown_backend_is_rejected
 
 printf '\n%d passed, %d failed\n' "$_passed" "$_failed"
 [[ "$_failed" -eq 0 ]]

@@ -159,6 +159,9 @@ isolation itself.
 
 - One machine per project directory, not one shared across all of them.
 - No Windows host story yet.
+- One runtime per machine. A machine is a microVM (`smolvm`) or a container
+  (`podman`), chosen by `backend`, never both — the shape records which, and
+  switching is a recreate, not a hand-off.
 - The generic `bx` core needs no account. The shipped `bx pi` recipe needs a
   Subconscious login or API key, because that's the provider the agent talks
   to. The `sandbox` recipe and anything you write need neither.
@@ -211,11 +214,46 @@ driver = "vfs"
 Running containers inside the guest widens what code inside the fence can do:
 the nested containers run as root with the guest's capability set.
 `SMOLVM_DOCKER_SOCKET` can publish `/var/run/docker.sock` across the boundary,
-which is a host-reaching bridge by design. And a nested container is a second
-long-lived, mutable thing inside the machine — with its own shape, its own
-locks, and its own reclamation problem. `bx` does **not** manage that lifecycle
-today; it manages the *machine's*. Treat containers-in-guest as something the
-agent does inside the sandbox, not as a second thing `bx` reconciles.
+which is a host-reaching bridge by design.
+
+### Containers as a backend, when you are already inside a machine
+
+That capability is also the answer to a real recursion problem. `bx` cannot
+boot a machine from inside a machine: the guest has no `smolvm`, and nested
+virtualization is off. But the guest *can* run containers, and bx's lifecycle —
+create, start, exec, stop, reconcile, lock, reclaim — is the same shape either
+way. So a recipe may name its runtime directly:
+
+```ini
+# ~/.bx/recipes/pg.conf — a container machine, managed like any other
+[pg]
+backend = podman
+image   = docker.io/library/postgres:16
+cpus    = 2
+mem     = 2048
+mounts  = $PWD:/work
+command = psql -U postgres -c 'SELECT version()'
+```
+
+With `backend = podman`, the ordinary bx verbs reach `podman create/start/
+stop/rm/exec`, mounts become bind mounts (`-v`), and secrets still cross by
+*name* (`-e GUEST`, with the value exported, never in argv). Everything else is
+unchanged: one driver per machine, the recorded shape, a refusal when the shape
+changed, `--reset`, `--status`, `--gc`, `--dry-run`.
+
+The backend is recorded **in** the shape, so a machine built as a vm is never
+silently reused as a container, or the reverse — the runtime that owns the
+mounts is part of what a machine *is*. There is one convenience on top: if a
+recipe names no backend, `smolvm` is on `PATH` nowhere but `podman` is present,
+bx selects `podman` and *says so*. It is never a silent substitution, and
+`--dry-run` prints the chosen backend either way.
+
+What this does not do (yet): podman can run many containers under one name and
+bx does not model a *group* of them; volumes are bind mounts, not podman
+volumes; and `--status`/`--gc` read only the containers bx itself created. A
+container machine is a second long-lived, mutable thing, and it earns the same
+reclamation question a vm does. `backend = podman` makes bx answer that
+question for containers too, instead of leaving it to the agent.
 
 
 ## Costs
@@ -402,10 +440,11 @@ a key is read from the environment, as a recipe key, or both; `profile`,
 | --- | --- | --- | --- |
 | `BX_COMMAND` | both | — | shell to run in the guest (required) |
 | `BX_MACHINE` | both | — | machine recipe to run on, replacing the recipe's shape |
-| `BX_IMAGE` | both | `debian:bookworm-slim` | guest image |
+| `BX_IMAGE` | both | `debian:bookworm-slim` | guest image (a container image when `backend = podman`) |
 | `BX_NAME` | both | `bx` | machine name |
 | `BX_CPUS` / `BX_MEM` | both | `4` / `4096` | vCPUs / MiB |
 | `BX_NET` | both | `1` | enable networking |
+| `BX_BACKEND` | both | `smolvm`, or `podman` when smolvm is absent | the runtime that owns the machine: `smolvm` (a microVM) or `podman` (a container) |
 | `BX_MOUNTS` | both | — | newline-separated `HOST:GUEST` pairs |
 | `BX_BOOTSTRAP` | both | — | shell run once in the guest before the command |
 | `BX_PRE_COMMAND` | both | — | host shell run after start, before the bootstrap |

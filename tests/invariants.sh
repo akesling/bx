@@ -293,8 +293,10 @@ test_boot_probe_accepts_macos() {
 }
 
 # ── containers in the guest are documented, with their caveat ────────────────
-# The README now claims you can run containers inside the guest, and names the
-# overlayfs storage caveat. That claim must not silently disappear.
+# The README claims you can run containers inside the guest, names the
+# overlayfs storage caveat, and now documents `backend = podman` as the way bx
+# manages a container machine from inside one. Those claims must not silently
+# disappear.
 test_containers_claim_is_documented() {
   _current="the containers-in-guest claim and its caveat are documented"
   local _readme="${_repo_root}/README.md"
@@ -307,8 +309,26 @@ test_containers_claim_is_documented() {
     _fail "README no longer explains the overlayfs storage-driver caveat"
     return
   fi
-  if ! grep -qF 'does **not** manage that lifecycle' "$_readme"; then
-    _fail "README no longer states that bx does not manage the nested-container lifecycle"
+  if ! grep -qF 'backend = podman' "$_readme"; then
+    _fail "README no longer documents the podman backend"
+    return
+  fi
+  _pass
+}
+
+# The backend is a safety boundary, not a convenience knob: a machine built as
+# a vm must not be reused as a container. That is code-level (the shape records
+# it) and is pinned in bx_test.sh; this pins the *documentation* of it, so the
+# reason cannot be edited away while the mechanism stays.
+test_backend_choice_is_documented() {
+  _current="the backend key and its never-silently-substituted rule are documented"
+  local _rreadme="${_repo_root}/recipes/README.md" _readme="${_repo_root}/README.md"
+  if ! grep -qF '| `backend` |' "$_rreadme"; then
+    _fail "recipes/README.md no longer lists the backend key"
+    return
+  fi
+  if ! grep -qF 'never a silent substitution' "$_readme"; then
+    _fail "README no longer states that an inferred backend is always announced"
     return
   fi
   _pass
@@ -355,6 +375,7 @@ test_claims_are_backed
 test_dry_run_needs_no_smolvm
 test_boot_probe_accepts_macos
 test_containers_claim_is_documented
+test_backend_choice_is_documented
 
 if [[ "${BX_REAL:-0}" == "1" ]]; then
   # Use the shipping predicate, not a copy: a bare /dev/kvm check would skip

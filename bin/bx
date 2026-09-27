@@ -46,7 +46,10 @@
 # Recipe keys (every bx setting, plus four):
 #   command, image, name, cpus, mem, net, mounts, workdir, keep, reset,
 #   bootstrap, bootstrap_env, secret_env, pre_command, name, state_dir,
-#   profile, extends, resolve, machine
+#   backend, profile, extends, resolve, machine
+# `backend` is the runtime that owns the machine: `smolvm` (a microVM; the
+# default) or `podman` (a container; use it inside a machine, where a vm
+# cannot boot). It is part of the shape, so changing it forces a recreate.
 # `mounts`, `bootstrap_env`, and `secret_env` may repeat; their lines are kept
 # in order. `#` starts a comment; values run to end of line after trimming. A
 # value continues on following lines if those lines are indented.
@@ -144,7 +147,7 @@ _usage() {
 # last file read wins) and appends to a multi-valued key (so all sources
 # contribute, in the order read: home, project, per-recipe).
 
-_recipe_keys="command image name cpus mem net mounts workdir keep reset bootstrap bootstrap_env secret_env pre_command state_dir profile extends resolve machine"
+_recipe_keys="command image name cpus mem net mounts workdir keep reset bootstrap bootstrap_env secret_env pre_command state_dir backend profile extends resolve machine"
 _multi_keys="mounts bootstrap_env secret_env"
 
 # A recipe key that is not a bx setting but describes the recipe itself.
@@ -156,7 +159,7 @@ _meta_keys="extends resolve machine"
 # with some of these and no `command`. A command recipe may name a machine with
 # `machine = ...` and override any of these keys; `--machine` on the command
 # line replaces them all. Kept as data so the two rules live in one place.
-_shape_keys="image name cpus mem net mounts workdir bootstrap bootstrap_env secret_env pre_command state_dir"
+_shape_keys="image name cpus mem net mounts workdir bootstrap bootstrap_env secret_env pre_command state_dir backend"
 
 # ── secret lifetimes ─────────────────────────────────────────────────────────
 # A `secret_env` entry is `GUEST=HOSTVAR[:LIFETIME]`. The lifetime is bx's
@@ -766,6 +769,7 @@ _apply_recipe_key() { # key value
     secret_env)    BX_SECRET_ENV="$_val" ;;
     pre_command)   BX_PRE_COMMAND="$_val" ;;
     state_dir)     BX_STATE_DIR="$_val" ;;
+    backend)       BX_BACKEND="$_val" ;;
     profile)       BX_PROFILE="$_val" ;;
   esac
 }
@@ -782,6 +786,7 @@ _dump_recipe() {
   printf 'recipe=%s\n' "$_name"
   printf 'command=%s\n' "${BX_COMMAND:-}"
   printf 'image=%s\n' "${BX_IMAGE:-debian:bookworm-slim}"
+  printf 'backend=%s\n' "${BX_BACKEND:-smolvm}"
   printf 'name=%s\n' "${BX_NAME:-bx}"
   printf 'cpus=%s\n' "${BX_CPUS:-4}"
   printf 'mem=%s\n' "${BX_MEM:-4096}"
@@ -951,7 +956,7 @@ _state_block() { # statefile key
 # private state is. This is the answer to "what exists, where, and from
 # where" that the lifecycle otherwise leaves implicit.
 _status_action() {
-  local _name _file _origin _dir_ok _running _lifetimes _size _found=0
+  local _name _file _origin _dir_ok _running _lifetimes _size _found=0 _b
   while IFS= read -r _name; do
     [[ -n "$_name" ]] || continue
     _found=1
@@ -959,19 +964,46 @@ _status_action() {
     _origin="$(_state_field "$_file" origin)"
     _dir_ok="gone"
     [[ -n "$_origin" && -d "$_origin" ]] && _dir_ok="present"
+    # The backend is recorded in the state file, so a machine created as a vm
+    # is queried as a vm even on a host where podman is the default. A machine
+    # from before `backend` existed is a smolvm one.
+    _b="$(_state_field "$_file" backend)"
+    [[ -n "$_b" ]] || _b="smolvm"
     _running="stopped"
-    if command -v smolvm >/dev/null 2>&1 && smolvm machine ls -q 2>/dev/null | grep -qx "$_name"; then
-      _running="exists"
-    fi
+    case "$_b" in
+      podman)
+        if command -v podman >/dev/null 2>&1 && \
+           podman ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$_name"; then
+          _running="exists"
+        fi ;;
+      *)
+        if command -v smolvm >/dev/null 2>&1 && \
+           smolvm machine ls -q 2>/dev/null | grep -qx "$_name"; then
+          _running="exists"
+        fi ;;
+    esac
     _lifetimes="$(_state_block "$_file" secret_lifetimes)"
     _lifetimes="${_lifetimes//$'\n'/, }"
     _size="?"
-    _size_dir="${SMOLVM_STORAGE:-/storage}/overlays/persistent-${_name}"
-    [[ -d "$_size_dir" ]] && _size="$(du -sh "$_size_dir" 2>/dev/null | cut -f1)"
+    case "$_b" in
+      podman)
+        # podman reports a container's writable size only with `--size`, and
+        # the value is the rw layer, not the image. Report it when we can, and
+        # an honest `?` when we cannot — never a guessed number.
+        if command -v podman >/dev/null 2>&1; then
+          _size="$(podman ps -a --size --filter "name=^${_name}$" --format '{{.Size}}' 2>/dev/null | head -1)"
+          _size="${_size%% *}"
+          [[ -n "$_size" ]] || _size="?"
+        fi ;;
+      *)
+        _size_dir="${SMOLVM_STORAGE:-/storage}/overlays/persistent-${_name}"
+        [[ -d "$_size_dir" ]] && _size="$(du -sh "$_size_dir" 2>/dev/null | cut -f1)" ;;
+    esac
     printf 'machine:  %s\n' "$_name"
+    printf 'backend:  %s\n' "$_b"
     printf 'image:    %s\n' "$(_state_field "$_file" image)"
     printf 'origin:   %s (%s)\n' "${_origin:-(unknown)}" "$_dir_ok"
-    printf 'smolvm:   %s\n' "$_running"
+    printf 'runtime:  %s\n' "$_running"
     printf 'size:     %s\n' "$_size"
     [[ -n "$_lifetimes" ]] && printf 'secrets:  %s\n' "$_lifetimes"
     printf 'state:    %s\n' "$_file"
@@ -986,7 +1018,7 @@ _status_action() {
 # here that is not reversible by reading state. A machine kept running on
 # purpose (`--keep`) is reclaimed too: its origin is gone, so it is orphaned.
 _gc_action() {
-  local _name _file _origin _reclaim=0
+  local _name _file _origin _reclaim=0 _b
   while IFS= read -r _name; do
     [[ -n "$_name" ]] || continue
     _file="$(_resolve_state_dir)/${_name}.state"
@@ -994,13 +1026,21 @@ _gc_action() {
     if [[ -n "$_origin" && -d "$_origin" ]]; then
       continue
     fi
+    _b="$(_state_field "$_file" backend)"
+    [[ -n "$_b" ]] || _b="smolvm"
     _reclaim=$((_reclaim + 1))
-    printf 'reclaim: %s (origin %s is gone)\n' "$_name" "${_origin:-(unknown)}"
+    printf 'reclaim: %s (%s; origin %s is gone)\n' "$_name" "$_b" "${_origin:-(unknown)}"
     if [[ "${_gc_yes:-0}" == "1" ]]; then
-      if command -v smolvm >/dev/null 2>&1; then
-        _quiet smolvm machine delete --name "$_name" -f || \
-          printf 'bx: could not delete machine %s\n' "$_name" >&2
-      fi
+      case "$_b" in
+        podman)
+          command -v podman >/dev/null 2>&1 && \
+            { _quiet podman rm -f "$_name" || \
+                printf 'bx: could not delete container %s\n' "$_name" >&2; } ;;
+        *)
+          command -v smolvm >/dev/null 2>&1 && \
+            { _quiet smolvm machine delete --name "$_name" -f || \
+                printf 'bx: could not delete machine %s\n' "$_name" >&2; } ;;
+      esac
       rm -f "$_file"
       rm -rf "$(_resolve_state_dir)/${_name}.lock.d"
       printf 'deleted: %s\n' "$_name"
@@ -1100,9 +1140,137 @@ mkdir -p "$_state_dir" 2>/dev/null || _die "could not create state dir $_state_d
 _state_file="${_state_dir}/${_vm_name}.state"
 _lock_dir="${_state_dir}/${_vm_name}.lock.d"
 
+# ── backend ─────────────────────────────────────────────────────────────────
+# bx's lifecycle verbs (create/start/stop/exec/delete) are the same shape
+# whether the machine is a microVM or a container; only the program performing
+# them differs. The backend is chosen explicitly by the recipe (`backend =
+# smolvm` or `backend = podman`), never inferred: a machine's mounts, secrets,
+# and reclamation differ between the two, and silently reusing one as the other
+# is exactly the reconciliation failure this tool exists to prevent.
+#
+# The one exception is the case this key was added for: bx running *inside* a
+# vm, where it cannot boot a vm of its own but the guest can run containers.
+# When the recipe says nothing and smolvm is absent while podman is present,
+# `podman` is selected and *said so* on stderr. It is a convenience, not a
+# guess: the plan (`--dry-run`) prints the backend either way, and a recipe
+# that means smolvm keeps meaning smolvm.
+_backend="${BX_BACKEND:-}"
+_backend_inferred=0
+if [[ -z "$_backend" ]]; then
+  if [[ "$_smolvm_present" == "1" ]]; then
+    _backend="smolvm"
+  elif command -v podman >/dev/null 2>&1; then
+    _backend="podman"
+    _backend_inferred=1
+  else
+    _backend="smolvm"
+  fi
+fi
+case "$_backend" in
+  smolvm|podman) ;;
+  *) _die "unknown backend '$_backend' (expected 'smolvm' or 'podman')" ;;
+esac
+# Say so, once, when the backend was inferred rather than declared. A recipe
+# that means a vm should be told it did not get one, and a user inside a vm
+# should be told why this run is a container.
+if [[ "$_backend_inferred" == "1" ]]; then
+  _run_note "smolvm is not on PATH; using backend 'podman' (containers nested in this environment). Set backend= to choose explicitly."
+fi
+_backend_program="$_backend"
+command -v "$_backend_program" >/dev/null 2>&1 || _backend_present=0
+_backend_present="${_backend_present:-1}"
+
+# Does a machine with this name already exist, according to the backend? smolvm
+# lists machine names; podman lists container names (running or stopped).
 _machine_exists() {
-  [[ "$_smolvm_present" == "1" ]] || return 1
-  smolvm machine ls -q 2>/dev/null | grep -qx "$_vm_name"
+  [[ "$_backend_present" == "1" ]] || return 1
+  case "$_backend" in
+    smolvm) smolvm machine ls -q 2>/dev/null | grep -qx "$_vm_name" ;;
+    podman) podman ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$_vm_name" ;;
+  esac
+}
+
+# ── backend verbs ───────────────────────────────────────────────────────────
+# One function per lifecycle step, dispatching on the backend. The call sites
+# below never name a runtime, so a new backend is added here and nowhere else.
+# The two backends differ in more than spelling, and the differences are
+# deliberate:
+#
+#   mounts   smolvm binds a host directory into the vm (`--volume H:G`);
+#            podman bind-mounts it (`-v H:G`). Same pair grammar.
+#   net      smolvm needs `--net` to enable it; a container is on the default
+#            bridge unless told `--network=none`.
+#   secrets  smolvm takes `--secret-env GUEST=HOST`; a container takes
+#            `-e GUEST`, inheriting the value from the exec's environment,
+#            which bx sets from the host variable by name. Either way the
+#            value never lands in argv — only the name does.
+#   image    smolvm pulls and unpacks a rootfs; podman pulls an image.
+_backend_create() { # none; reads _create_args-shaped inputs from caller
+  case "$_backend" in
+    smolvm) _quiet_or_die "could not create machine $_vm_name" \
+              smolvm machine create "${_create_args[@]}" ;;
+    podman) _quiet_or_die "could not create container $_vm_name" \
+              podman create "${_create_args[@]}" ;;
+  esac
+}
+
+_backend_start() {
+  case "$_backend" in
+    smolvm) _quiet_or_die "machine '$_vm_name' failed to start. If its mounts or image changed
+since it was created, recreate it: bx --reset" \
+              smolvm machine start --name "$_vm_name" ;;
+    podman) _quiet_or_die "container '$_vm_name' failed to start. If its mounts or image changed
+since it was created, recreate it: bx --reset" \
+              podman start "$_vm_name" ;;
+  esac
+}
+
+_backend_stop() {
+  case "$_backend" in
+    smolvm) _quiet smolvm machine stop --name "$_vm_name" || true ;;
+    podman) _quiet podman stop "$_vm_name" || true ;;
+  esac
+}
+
+_backend_delete() {
+  case "$_backend" in
+    smolvm) _quiet smolvm machine delete --name "$_vm_name" -f || true ;;
+    podman) _quiet podman rm -f "$_vm_name" || true ;;
+  esac
+}
+
+# Exec is the one verb with a material difference in argument shape, because
+# the secret and env passing differs. The caller supplies the secret/env args
+# already rendered for the backend by `_backend_secret_args` and
+# `_backend_env_args`; here we only choose the program and the exec form.
+_backend_exec() { # tty(0|1) command
+  local _tty="$1" _cmd="$2"
+  case "$_backend" in
+    smolvm)
+      if [[ "$_tty" == "1" ]]; then
+        smolvm machine exec --name "$_vm_name" -i -t \
+          ${_secret_args[@]+"${_secret_args[@]}"} \
+          ${_passthrough_env_args[@]+"${_passthrough_env_args[@]}"} \
+          -- bash -lc "$_cmd"
+      else
+        smolvm machine exec --name "$_vm_name" \
+          ${_secret_args[@]+"${_secret_args[@]}"} \
+          ${_passthrough_env_args[@]+"${_passthrough_env_args[@]}"} \
+          -- bash -lc "$_cmd"
+      fi ;;
+    podman)
+      if [[ "$_tty" == "1" ]]; then
+        podman exec -i -t \
+          ${_secret_args[@]+"${_secret_args[@]}"} \
+          ${_passthrough_env_args[@]+"${_passthrough_env_args[@]}"} \
+          "$_vm_name" bash -lc "$_cmd"
+      else
+        podman exec -i \
+          ${_secret_args[@]+"${_secret_args[@]}"} \
+          ${_passthrough_env_args[@]+"${_passthrough_env_args[@]}"} \
+          "$_vm_name" bash -lc "$_cmd"
+      fi ;;
+  esac
 }
 
 # The recorded shape, or empty when this name has never been created here.
@@ -1114,6 +1282,7 @@ _want_shape="image=$_image
 cpus=$_vm_cpus
 mem=$_vm_mem
 net=$_net
+backend=$_backend
 mounts:
 $_want_mounts"
 # Normalize the trailing newline once, so the in-memory shape and the one read
@@ -1121,17 +1290,28 @@ $_want_mounts"
 # stray blank line that makes a machine look like it changed shape every run.
 _want_shape="${_want_shape%$'\n'}"
 
-# Parse the secret list once, into the args smolvm needs plus the lifetimes bx
-# records. The declared lifetime is a property of the shape, so a run that
-# changes it (e.g. a value gaining `:persisted`) is a shape change and is
-# reconciled like any other. This is what makes a secret's reach auditable
+# Parse the secret list once, into the args the backend needs plus the
+# lifetimes bx records. The declared lifetime is a property of the shape, so a
+# run that changes it (e.g. a value gaining `:persisted`) is a shape change and
+# is reconciled like any other. This is what makes a secret's reach auditable
 # instead of implicit.
+#
+# The value is passed by *name* either way: smolvm's `--secret-env GUEST=HOST`
+# resolves HOST in the parent environment; podman has no equivalent, so bx
+# exports HOST and asks podman for `-e GUEST`, omitting the value from argv.
+# The invariant the test suite pins — the secret's value is never in argv —
+# holds for both backends; only the *name* appears.
 _secret_args=()
+_secret_exports=()
 _secret_lifetimes_record=""
 while IFS= read -r _spec; do
   [[ -n "$_spec" ]] || continue
   _secret_split "$_spec"
-  _secret_args+=(--secret-env "${_secret_guest}=${_secret_host}")
+  case "$_backend" in
+    smolvm) _secret_args+=(--secret-env "${_secret_guest}=${_secret_host}") ;;
+    podman) _secret_args+=(-e "${_secret_guest}")
+            _secret_exports+=("${_secret_host}") ;;
+  esac
   _secret_lifetimes_record="${_secret_lifetimes_record}${_secret_guest}=${_secret_life}
 "
 done < <(_read_lines "${BX_SECRET_ENV:-}")
@@ -1153,16 +1333,21 @@ else
   _persisted_secret=0
 fi
 
-# The shape's stable core is the create-time binding smolvm fixes: image,
-# resources, and mounts. `secret_lifetimes` and `origin` are bx bookkeeping —
-# they are recorded and reported, but they are not bound by smolvm at create
-# time, so a change in them must not force a recreate. Keeping the comparison
-# on the core means an old state file (written before these fields existed)
-# still matches and reuses, rather than becoming a false conflict on upgrade.
+# The shape's stable core is the create-time binding the backend fixes:
+# image, resources, mounts, and which backend owns them. `secret_lifetimes`
+# and `origin` are bx bookkeeping — they are recorded and reported, but they
+# are not bound at create time, so a change in them must not force a recreate.
+# `backend` joined the core when containers did: a vm and a container are not
+# interchangeable, so a machine recorded without one is treated as `smolvm`
+# (the only backend that existed) rather than as a mismatch.
+#
+# Keeping the comparison on the core means an old state file (written before
+# these fields existed) still matches and reuses, rather than becoming a false
+# conflict on upgrade.
 _shape_matches() {
   [[ "$(_recorded_shape)" == "$_want_shape" ]] && return 0
-  # Fall back to comparing only the smolvm-bound core, so a record that lacks
-  # the newer bookkeeping fields still reuses a matching machine.
+  # Fall back to comparing only the create-time-bound core, so a record that
+  # lacks the newer bookkeeping fields still reuses a matching machine.
   _rec="$(_recorded_shape)"
   [[ -n "$_rec" ]] || return 1
   local _rec_core _want_core
@@ -1170,6 +1355,12 @@ _shape_matches() {
   _rec_core="${_rec_core%%$'\n'origin=*}"
   _want_core="$_want_shape"; _want_core="${_want_core%%$'\n'secret_lifetimes:*}"
   _want_core="${_want_core%%$'\n'origin=*}"
+  # A record with no `backend=` predates the key and was necessarily a smolvm
+  # machine, so drop the line from the wanted core before comparing rather
+  # than reporting a false conflict on the first run after an upgrade.
+  if [[ "$_rec_core" != *$'\n'backend=* ]]; then
+    _want_core="$(printf '%s\n' "$_want_core" | grep -v '^backend=')"
+  fi
   [[ "$_rec_core" == "$_want_core" ]]
 }
 
@@ -1182,6 +1373,15 @@ _shape_matches() {
 # guess. When the layout is absent, the answer is `unknown`, never a silent
 # `no`, so the cost line stays honest.
 _image_cached() {
+  # podman can answer this directly, so ask it rather than guessing.
+  if [[ "$_backend" == "podman" ]]; then
+    if command -v podman >/dev/null 2>&1; then
+      if podman image exists "$1" 2>/dev/null; then printf 'cached'; else printf 'not cached'; fi
+    else
+      printf 'unknown'
+    fi
+    return 0
+  fi
   local _root="${SMOLVM_STORAGE:-/storage}"
   local _safe
   _safe="$(printf '%s' "$1" | sed 's#[/:]#_#g')"
@@ -1193,6 +1393,10 @@ _image_cached() {
 }
 
 _toolchain_present() {
+  # A container's writable layer is podman's, and bx does not read inside it;
+  # the smolvm overlay layout is the only one bx understands. Say so rather
+  # than lie about a layer bx cannot see.
+  [[ "$_backend" == "smolvm" ]] || { printf 'unknown'; return 0; }
   local _root="${SMOLVM_STORAGE:-/storage}"
   local _upper="$_root/overlays/persistent-${_vm_name}/upper"
   if [[ -d "$_upper" ]]; then
@@ -1218,8 +1422,9 @@ else
 fi
 
 if [[ "$_dry_run" == "1" ]]; then
-  printf 'machine=%s\nimage=%s\ncpus=%s\nmem=%s\nnet=%s\nworkdir=%s\naction=%s\nlock=%s\nstate=%s\nmounts=' \
-    "$_vm_name" "$_image" "$_vm_cpus" "$_vm_mem" "$_net" "${_workdir:-(none)}" \
+  printf 'machine=%s
+backend=%s\nimage=%s\ncpus=%s\nmem=%s\nnet=%s\nworkdir=%s\naction=%s\nlock=%s\nstate=%s\nmounts=' \
+    "$_vm_name" "$_backend" "$_image" "$_vm_cpus" "$_vm_mem" "$_net" "${_workdir:-(none)}" \
     "$_action" "$_lock_dir" "$_state_file"
   if [[ -n "$_want_mounts" ]]; then
     printf '\n'
@@ -1244,8 +1449,9 @@ if [[ "$_dry_run" == "1" ]]; then
 fi
 
 # A real run needs the runtime. `--dry-run` deliberately does not, so the plan
-# and cost model can be inspected on a host without smolvm installed.
-[[ "$_smolvm_present" == "1" ]] || _die "smolvm is not on PATH (it is required for a real run; --dry-run and --status do not need it)"
+# and cost model can be inspected on a host without the backend installed.
+[[ "$_backend_present" == "1" ]] || \
+  _die "backend '$_backend' is not on PATH (it is required for a real run; --dry-run and --status do not need it)"
 if [[ "$_action" == "conflict" ]]; then
   if [[ -z "$(_recorded_shape)" ]]; then
     _die "machine '$_vm_name' already exists but has no recorded shape (it was
@@ -1256,8 +1462,8 @@ resources are known: pass --reset."
 $(printf '%s\n' "$_want_shape" | sed 's/^/  want: /')
   have:
 $(_recorded_shape | sed 's/^/    /')
-smolvm binds mounts and resources at create time, so this cannot be fixed by
-starting again. Pass --reset to recreate it."
+the runtime binds mounts and resources at create time, so this cannot be fixed
+by starting again. Pass --reset to recreate it."
 fi
 
 # ── lock ────────────────────────────────────────────────────────────────────
@@ -1283,23 +1489,37 @@ fi
 # ── lifecycle ───────────────────────────────────────────────────────────────
 if [[ "$_action" == "recreate" && "$_exists" == "1" ]]; then
   _run_say "recreating $_vm_name"
-  _quiet smolvm machine delete --name "$_vm_name" -f || true
+  _backend_delete
   _exists=0
 fi
 
 if [[ "$_exists" == "0" ]]; then
-  _create_args=(--name "$_vm_name" --image "$_image" --cpus "$_vm_cpus" --mem "$_vm_mem")
-  [[ "$_net" == "1" ]] && _create_args+=(--net)
-  while IFS= read -r _mount; do
-    [[ -n "$_mount" ]] || continue
-    _create_args+=(--volume "$_mount")
-  done < <(printf '%s\n' "$_want_mounts")
+  case "$_backend" in
+    smolvm)
+      _create_args=(--name "$_vm_name" --image "$_image" --cpus "$_vm_cpus" --mem "$_vm_mem")
+      [[ "$_net" == "1" ]] && _create_args+=(--net)
+      while IFS= read -r _mount; do
+        [[ -n "$_mount" ]] || continue
+        _create_args+=(--volume "$_mount")
+      done < <(printf '%s\n' "$_want_mounts") ;;
+    podman)
+      # A container runs until its command exits; bx execs into it repeatedly,
+      # so it is created with a long-lived command and stopped by `podman
+      # stop`. `--entrypoint` empty plus `sleep infinity` gives exactly that.
+      _create_args=(--name "$_vm_name" --cpus "$_vm_cpus" --memory "${_vm_mem}m")
+      [[ "$_net" == "0" ]] && _create_args+=(--network=none)
+      while IFS= read -r _mount; do
+        [[ -n "$_mount" ]] || continue
+        _create_args+=(-v "$_mount")
+      done < <(printf '%s\n' "$_want_mounts")
+      _create_args+=(--entrypoint '' "$_image" sleep infinity) ;;
+  esac
   # A first run is the only slow, chatty one: image pull, rootfs unpack. Say so
-  # plainly, and surface smolvm's own output if it fails.
+  # plainly, and surface the runtime's own output if it fails.
   _run_say "creating $_vm_name from $_image (first run; this may take a minute)"
   [[ "$_persisted_secret" == "1" ]] && \
     _run_note "this machine declares a persisted secret; its value may reach a durable path"
-  _quiet_or_die "could not create machine $_vm_name" smolvm machine create "${_create_args[@]}"
+  _backend_create
   printf '%s\n' "$_want_shape" >"$_state_file"
 else
   # Warm path: the machine already exists with the right shape. Stay quiet
@@ -1307,11 +1527,9 @@ else
   _trace "reusing machine $_vm_name"
 fi
 
-# Starting a stopped machine is an expected, silent step. Only replay smolvm's
-# banner if it actually fails, or if the user asked for the trace.
-_quiet_or_die "machine '$_vm_name' failed to start. If its mounts or image changed
-since it was created, recreate it: bx --reset" \
-  smolvm machine start --name "$_vm_name"
+# Starting a stopped machine is an expected, silent step. Only replay the
+# runtime's banner if it actually fails, or if the user asked for the trace.
+_backend_start
 
 # Stop the VM on exit unless the caller asked to keep it, and release the lock.
 # The trap runs even after the guest command fails, so the machine is never
@@ -1320,7 +1538,7 @@ since it was created, recreate it: bx --reset" \
 _cleanup() {
   local _status=$?
   [[ "$_no_lock" == "1" ]] || rm -rf "$_lock_dir"
-  [[ "$_keep" == "1" ]] || _quiet smolvm machine stop --name "$_vm_name" || true
+  [[ "$_keep" == "1" ]] || _backend_stop
   return "$_status"
 }
 trap '_cleanup; exit $?' EXIT
@@ -1336,19 +1554,39 @@ fi
 _bootstrap_env_args=()
 while IFS= read -r _pair; do
   [[ -n "$_pair" ]] || continue
-  _bootstrap_env_args+=(--env "$_pair")
+  case "$_backend" in
+    smolvm) _bootstrap_env_args+=(--env "$_pair") ;;
+    podman) _bootstrap_env_args+=(-e "$_pair") ;;
+  esac
 done < <(_read_lines "${BX_BOOTSTRAP_ENV:-}")
 
 # Forward the curated host environment (terminal type, locale, colour) so a
 # program inside the machine behaves as it does on the host for the things a
 # user controls. Only variables on the allowlist cross; a credential or socket
-# variable is never included. `smolvm --env NAME=VALUE` sets the guest value
-# literally, so each is expanded from the host here.
+# variable is never included. `NAME=VALUE` sets the guest value literally, so
+# each is expanded from the host here.
 _passthrough_env_args=()
 for _name in $_bx_env_passthrough; do
   _val="${!_name:-}"
-  [[ -n "$_val" ]] && _passthrough_env_args+=(--env "${_name}=${_val}")
+  [[ -n "$_val" ]] || continue
+  case "$_backend" in
+    smolvm) _passthrough_env_args+=(--env "${_name}=${_val}") ;;
+    podman) _passthrough_env_args+=(-e "${_name}=${_val}") ;;
+  esac
 done
+
+# For podman, a secret crosses as `-e GUEST` and inherits its value from the
+# exec's environment, so the host variable must be exported here. For smolvm,
+# `--secret-env GUEST=HOST` does the resolution itself and nothing is exported.
+if [[ "$_backend" == "podman" && ${#_secret_exports[@]} -gt 0 ]]; then
+  for _host_name in "${_secret_exports[@]}"; do
+    # `export "$name"` exports the variable *named by* the value, which is
+    # what we want here. shellcheck reads the quotes as an indirect-export
+    # mistake; it is the documented idiom for a name held in a variable.
+    # shellcheck disable=SC2163
+    export "$_host_name"
+  done
+fi
 
 if [[ -n "${BX_BOOTSTRAP:-}" ]]; then
   # The bootstrap is idempotent and runs on every boot, so it is only worth a
@@ -1357,10 +1595,18 @@ if [[ -n "${BX_BOOTSTRAP:-}" ]]; then
   # avoid. `-v` always shows it.
   _trace "bootstrap"
   set +e
-  smolvm machine exec --name "$_vm_name" \
-    ${_secret_args[@]+"${_secret_args[@]}"} \
-    ${_bootstrap_env_args[@]+"${_bootstrap_env_args[@]}"} \
-    -- bash -c "$BX_BOOTSTRAP"
+  case "$_backend" in
+    smolvm)
+      smolvm machine exec --name "$_vm_name" \
+        ${_secret_args[@]+"${_secret_args[@]}"} \
+        ${_bootstrap_env_args[@]+"${_bootstrap_env_args[@]}"} \
+        -- bash -c "$BX_BOOTSTRAP" ;;
+    podman)
+      podman exec -i \
+        ${_secret_args[@]+"${_secret_args[@]}"} \
+        ${_bootstrap_env_args[@]+"${_bootstrap_env_args[@]}"} \
+        "$_vm_name" bash -c "$BX_BOOTSTRAP" ;;
+  esac
   _bootstrap_status=$?
   set -e
   [[ "$_bootstrap_status" == 0 ]] || exit "$_bootstrap_status"
@@ -1389,15 +1635,9 @@ fi
 # `set -e`.
 set +e
 if [[ -t 0 && -t 1 ]]; then
-  smolvm machine exec --name "$_vm_name" -i -t \
-    ${_secret_args[@]+"${_secret_args[@]}"} \
-    ${_passthrough_env_args[@]+"${_passthrough_env_args[@]}"} \
-    -- bash -lc "$_command"
+  _backend_exec 1 "$_command"
 else
-  smolvm machine exec --name "$_vm_name" \
-    ${_secret_args[@]+"${_secret_args[@]}"} \
-    ${_passthrough_env_args[@]+"${_passthrough_env_args[@]}"} \
-    -- bash -lc "$_command"
+  _backend_exec 0 "$_command"
 fi
 _guest_status=$?
 set -e
