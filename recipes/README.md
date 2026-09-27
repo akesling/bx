@@ -14,14 +14,44 @@ many commands and few machines. They share one grammar; only the directory
 differs. Read in increasing precedence, so a later source overrides an earlier
 one:
 
-1. `share/bx/machines/`, `share/bx/recipes/` in the install prefix — the
-   shipped book.
+1. `share/bx/machines/`, `share/bx/recipes/` under the install prefix — the
+   shipped book. (In the source tree, the same files are `machines/` and
+   `recipes/` at the repository root.)
 2. `~/.bx.conf`, `./.bx.conf` — flat files that may hold **both** kinds.
 3. `~/.bx/machines/`, `./.bx/machines/` — machine recipes.
 4. `~/.bx/recipes/`, `./.bx/recipes/` — command recipes.
 
 A recipe with the same name in a later source overrides the earlier one whole
 (see **Composition** for the part that still merges).
+
+## Seeing what is in a book
+
+`bx --list` prints every recipe, one per line, each with the description taken
+from the **comment block directly above its `[section]`**. The first sentence
+of that comment is the description, so a book documents itself at the point
+where you look for it:
+
+```
+$ bx --list
+  bash      run a bash command in a machine with only $PWD mounted.
+  default   the generic sandbox shape: a Debian image with $PWD mounted at /work.  (machine)
+  pi        the pi coding agent, in a microVM, with only your project mounted.
+  pi_agent  the machine the `pi` recipe runs on: more CPU and memory than the…  (machine)
+  sandbox   a bare interactive Debian shell in a machine with only $PWD mounted.
+```
+
+A recipe whose comment begins with its own name followed by a separator
+(`bash — …`, `bash: …`) has the name stripped, since the name is already the
+column. A machine recipe — one with no `command` — is marked `(machine)`, so
+you can tell a shape from a command at a glance.
+
+A mistyped name suggests the close one rather than only listing everything:
+
+```
+$ bx pai
+bx: no recipe named 'pai' (available: bash default pi pi_agent sandbox)
+did you mean 'pi'?
+```
 
 ## Machines and commands
 

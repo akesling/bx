@@ -250,8 +250,14 @@ _store_append() { # name key value
 }" "$3"
 }
 
+# The description a `--list` shows for a recipe. Held in `_desc_<name>`, set
+# from the comment block immediately above the `[section]` line. `just` taught
+# the world that the comment above a recipe is its documentation; the shipped
+# book already writes one, so this costs recipe authors nothing.
 _load_file() {
   local _file="$1" _line _section="" _key _val _continuation=0
+  local _pending_desc="" _saw_comment=0
+  _file_desc=""
   [[ -f "$_file" ]] || return 0
   while IFS= read -r _line || [[ -n "$_line" ]]; do
     # A value continues onto following lines until a new `key = value`, a new
@@ -276,8 +282,25 @@ _load_file() {
       fi
     fi
     _continuation=0
+    # Remember the comment block above a `[section]` as its description. A
+    # blank line or any key=value between the comment and the section clears
+    # it, so only a directly-above comment counts. The whole block is
+    # accumulated (lines joined with a space) because these comments are
+    # wrapped prose: the first *sentence* is the description, and it may span
+    # two physical lines. A leading file-level comment is captured too, so a
+    # one-recipe file that opens with `# name — what it does` still works.
+    case "$_line" in
+      '#'*)
+        _comment="$(_trim "${_line#\#}")"
+        if [[ "$_section" == "" ]]; then
+          _file_desc="${_file_desc:+${_file_desc} }${_comment}"
+        else
+          _pending_desc="${_pending_desc:+${_pending_desc} }${_comment}"
+        fi
+        continue ;;
+    esac
     _line="$(_trim "${_line%%#*}")"
-    [[ -n "$_line" ]] || continue
+    if [[ -z "$_line" ]]; then _pending_desc=""; continue; fi
     if [[ "$_line" == '['*']' ]]; then
       _section="$(_trim "${_line#[}")"
       _section="$(_trim "${_section%]}")"
@@ -295,6 +318,19 @@ ${_section}
         *) _recipe_names="${_recipe_names}${_section}
 " ;;
       esac
+      # A description set by an earlier file is not overwritten by a later
+      # one that has no comment: the recipe is the name, its doc may live in
+      # whichever source first declared it. Held in `_desc_<name>`, not the
+      # `_cfg_` namespace, so it can never collide with a user's key.
+      if [[ -n "$_pending_desc" ]]; then
+        printf -v "_desc_${_section}" '%s' "$_pending_desc"
+      else
+        eval "_have_desc=\${_desc_${_section}:-}"
+        if [[ -z "$_have_desc" && -n "$_file_desc" ]]; then
+          printf -v "_desc_${_section}" '%s' "$_file_desc"
+        fi
+      fi
+      _pending_desc=""
       continue
     fi
     [[ -n "$_section" ]] || _die "$_file: line outside a [recipe]: $_line"
@@ -380,11 +416,148 @@ _load_dir() { # directory
   done
 }
 
-_recipe_list() {
+# Names only, one per line — for `--list`'s machine consumers and the
+# "available:" tail of an error. Kept separate from `_recipe_list` so a
+# future caller can ask for names without the prose.
+_recipe_names_only() {
   local _r
   for _r in $_recipe_names; do
     [[ -n "$_r" ]] && printf '%s\n' "$_r"
   done | sort -u
+  return 0
+}
+
+# Format the suggestion for an error message, or nothing at all. Kept apart
+# from `_suggest_recipe` so the caller controls punctuation.
+_recipe_hint() { # name
+  local _s
+  _s="$(_suggest_recipe "$1")"
+  [[ -n "$_s" ]] && printf "\ndid you mean '%s'?" "$_s"
+  return 0
+}
+
+# A close name from the book, for an unknown-recipe error. `just`'s "Did you
+# mean 'build'?" is the single cheapest pickup aid in its toolkit: a typo is
+# the most common failure at the front door, and the answer is already known.
+# Plain edit-distance, capped so a wild guess never masquerades as help.
+_suggest_recipe() { # name
+  local _want="$1" _r _best="" _bestd=99 _d
+  for _r in $(_recipe_names_only); do
+    [[ "$_r" == "$_want" ]] && continue
+    _d=$(_edit_distance "$_want" "$_r")
+    if [[ "$_d" -lt "$_bestd" ]]; then _bestd="$_d"; _best="$_r"; fi
+  done
+  # Offer only a genuinely close match: within a third of the input's length,
+  # or any prefix relationship ("go_" -> "go_test").
+  [[ -n "$_best" ]] || return 0
+  case "$_want" in
+    "$_best"*) printf '%s' "$_best"; return 0 ;;
+  esac
+  case "$_best" in
+    "$_want"*) printf '%s' "$_best"; return 0 ;;
+  esac
+  local _limit=$(( ${#_want} / 3 + 1 ))
+  [[ "$_bestd" -le "$_limit" ]] && printf '%s' "$_best"
+  return 0
+}
+
+# Levenshtein distance, iterative, no external tools. Bash 3.2 has no
+# associative arrays, so the DP row is a plain indexed array. Names are short,
+# so the O(n*m) cost is irrelevant.
+_edit_distance() { # a b
+  local _a="$1" _b="$2" _la=${#1} _lb=${#2} _i _j _cost
+  [[ "$_a" == "$_b" ]] && { printf '0'; return 0; }
+  [[ "$_la" -eq 0 ]] && { printf '%s' "$_lb"; return 0; }
+  [[ "$_lb" -eq 0 ]] && { printf '%s' "$_la"; return 0; }
+  local _prev _cur
+  for (( _j=0; _j<=_lb; _j++ )); do _prev[$_j]=$_j; done
+  for (( _i=1; _i<=_la; _i++ )); do
+    _cur[0]=$_i
+    for (( _j=1; _j<=_lb; _j++ )); do
+      if [[ "${_a:_i-1:1}" == "${_b:_j-1:1}" ]]; then _cost=0; else _cost=1; fi
+      local _del=$(( ${_prev[$_j]} + 1 )) _ins=$(( ${_cur[$((_j-1))]} + 1 ))
+      local _sub=$(( ${_prev[$((_j-1))]} + _cost )) _min=$_del
+      [[ "$_ins" -lt "$_min" ]] && _min=$_ins
+      [[ "$_sub" -lt "$_min" ]] && _min=$_sub
+      _cur[$_j]=$_min
+    done
+    for (( _j=0; _j<=_lb; _j++ )); do _prev[$_j]=${_cur[$_j]}; done
+  done
+  printf '%s' "${_prev[$_lb]}"
+  return 0
+}
+
+# Shape a recipe's comment block into one list line. The shipped book opens
+# each file with a prose paragraph whose first line is `<name> — <summary>`;
+# the name is already the column, so drop the prefix, take the first sentence,
+# and collapse whitespace. A `just` user expects exactly one line here, and a
+# list that wraps is a list nobody reads.
+_list_desc() { # name raw
+  local _name="$1" _d="$2" _stripped
+  [[ -n "$_d" ]] || return 0
+  # Strip a leading `name — `, `name – `, `name - `, or `name: ` prefix. Match
+  # the separator as a whole string (never `${x#?}`, which eats one byte of a
+  # multibyte dash and leaves mojibake). The name is dropped whether or not a
+  # space separates it from the punctuation, but only when one of these
+  # separators follows, so a comment that is merely a sentence beginning with
+  # the recipe name is left whole.
+  case "$_d" in
+    "$_name"[[:space:]]*)
+      _stripped="$(_trim "${_d#"$_name"}")"
+      case "$_stripped" in
+        '— '*) _d="${_stripped#— }" ;;
+        '– '*) _d="${_stripped#– }" ;;
+        '- '*)  _d="${_stripped#- }" ;;
+        ': '*)  _d="${_stripped#: }" ;;
+      esac ;;
+    "$_name"[—–-]*)
+      _stripped="${_d#"$_name"}"
+      case "$_stripped" in
+        '— '*) _d="${_stripped#— }" ;;
+        '– '*) _d="${_stripped#– }" ;;
+        '- '*)  _d="${_stripped#- }" ;;
+      esac ;;
+    "$_name":*)
+      _stripped="$(_trim "${_d#"$_name"}")"
+      [[ "$_stripped" == ': '* ]] && _d="${_stripped#: }" ;;
+  esac
+  # First sentence: cut at the first `. ` with more text after it, keeping the
+  # period. A description that is already one clause is left whole.
+  case "$_d" in
+    *'. '*) _d="${_d%%. *}." ;;
+  esac
+  if [[ ${#_d} -gt 72 ]]; then
+    # Cut on a word boundary and append an ellipsis, so the column stays a
+    # column and no line ends in a stray space.
+    _d="$(_trim "${_d:0:69}")"
+    _d="${_d% *}…"
+  fi
+  printf '%s' "$_d"
+  return 0
+}
+
+# `--list`: the format's front door. A bare name teaches nothing; `just`
+# showed that a name plus its one-line description is how a book becomes
+# browsable without opening a file. The description is the comment block
+# above the recipe (see `_load_file`), padded so the column of prose lines up.
+# A machine recipe is marked, since it is never run on its own and a bare `bx
+# <machine>` is a mistake worth preventing.
+_recipe_list() {
+  local _r _desc _cmd _kind _width=0
+  for _r in $(_recipe_names_only); do
+    [[ ${#_r} -gt $_width ]] && _width=${#_r}
+  done
+  for _r in $(_recipe_names_only); do
+    eval "_desc=\${_desc_${_r}:-}"
+    eval "_cmd=\${_cfg_${_r}_command:-}"
+    [[ -n "$_cmd" ]] && _kind="" || _kind="  (machine)"
+    _desc="$(_list_desc "$_r" "$_desc")"
+    if [[ -n "$_desc" ]]; then
+      printf '  %-*s  %s%s\n' "$_width" "$_r" "$_desc" "$_kind"
+    else
+      printf '  %-*s%s\n' "$_width" "$_r" "$_kind"
+    fi
+  done
   return 0
 }
 
@@ -402,6 +575,7 @@ _recipe_list() {
 # the grammar is identical and both may be loaded from either place.
 _load_sources() {
   _recipe_names=""
+  _file_desc=""
   local _book _mdir
   _book="$(_recipes_dir)"
   _mdir="$(_machines_dir)"
@@ -647,7 +821,11 @@ _scaffold_recipe() {
   # `machine = ` lines as assignments.
   # shellcheck disable=SC2283
   cat >"$_file" <<EOF
-# ${_name} — a bx recipe. Run it with: bx ${_name}
+# ${_name} — describe what this recipe does here. This first sentence is
+# shown by \`bx --list\`, so make it count.
+#
+# Run it with: bx ${_name}
+# Inspect it with: bx --show ${_name}
 #
 # This is a command recipe with a shape of its own. To share a shape with
 # other recipes, put it in ~/.bx/machines/<name>.conf and replace the shape
@@ -657,7 +835,8 @@ _scaffold_recipe() {
 #
 # A command recipe may still override any shape key after \`machine =\`.
 #
-# The format is documented in the shipped book: share/bx/recipes/README.md.
+# The format is documented with the book: recipes/README.md in a checkout,
+# share/bx/recipes/README.md once installed.
 
 [${_name}]
 image    = debian:bookworm-slim
@@ -853,7 +1032,8 @@ fi
 if [[ -n "$_show" || -n "$_recipe" ]]; then
   _load_sources
   _target="${_show:-$_recipe}"
-  _has_recipe "$_target" || _die "no recipe named '$_target' (available: $(printf '%s' "$(_recipe_list)" | tr '\n' ' '))"
+  _has_recipe "$_target" || \
+    _die "no recipe named '$_target' (available: $(printf '%s' "$(_recipe_names_only)" | tr '\n' ' '))$(_recipe_hint "$_target")"
   _resolve_recipe "$_target"
 fi
 

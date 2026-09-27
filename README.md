@@ -246,8 +246,22 @@ many as you want.
 ```sh
 bx pi            # the shipped pi recipe
 bx sandbox       # a bare shell in a machine, to poke at
-bx --list        # what is available
+bx --list        # what is available, each with the comment above it
 bx --new mine    # scaffold your own, then `bx --show mine`
+```
+
+`--list` reads each recipe's leading comment as its description, so a book
+explains itself. A mistyped name suggests the close one:
+
+```sh
+bx --list
+#   bash      run a bash command in a machine with only $PWD mounted.
+#   pi        the pi coding agent, in a microVM, with only your project mounted.
+#   sandbox   a bare interactive Debian shell in a machine with only $PWD mounted.
+
+bx pi2
+# bx: no recipe named 'pi2' (available: bash pi sandbox)
+# did you mean 'pi'?
 ```
 
 Many commands, few machines is the common shape, so they live in separate

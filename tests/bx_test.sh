@@ -516,6 +516,53 @@ test_recipe_list() {
   rm -rf "$_rhome" "$_rproj"
 }
 
+test_recipe_list_shows_description() {
+  _current="--list shows the comment above a recipe as its description"
+  local out
+  _recipe_env
+  printf '# alpha: builds the thing. More prose follows.\n[alpha]\ncommand = true\n' \
+    >"$_rproj/.bx.conf"
+  out="$(_run_recipe_bx --list)"
+  assert_contains "builds the thing." "$out" "shows the first sentence"
+  assert_not_contains "More prose" "$out" "cuts after the first sentence"
+  # The name is already the column, so it is not repeated as a prefix.
+  assert_not_contains "alpha: builds" "$out" "strips the name prefix"
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_list_marks_machines() {
+  _current="--list marks a machine recipe, which is never run on its own"
+  local out
+  _recipe_env
+  mkdir -p "$_rproj/.bx/machines"
+  printf '[big]\nmounts = $PWD:/work\n' >"$_rproj/.bx/machines/big.conf"
+  out="$(_run_recipe_bx --list)"
+  assert_contains "big" "$out" "lists the machine"
+  assert_contains "(machine)" "$out" "marks it as a machine"
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_typo_suggests_the_close_name() {
+  _current="a mistyped recipe suggests the close name"
+  local out
+  _recipe_env
+  printf '[deploy]\ncommand = true\n' >"$_rproj/.bx.conf"
+  out="$(_run_recipe_bx deployy)"
+  assert_contains "no recipe named 'deployy'" "$out" "names the miss"
+  assert_contains "did you mean 'deploy'?" "$out" "suggests deploy"
+  rm -rf "$_rhome" "$_rproj"
+}
+
+test_recipe_typo_far_away_suggests_nothing() {
+  _current="a name with no close match gets no false suggestion"
+  local out
+  _recipe_env
+  printf '[deploy]\ncommand = true\n' >"$_rproj/.bx.conf"
+  out="$(_run_recipe_bx zzzzzz)"
+  assert_not_contains "did you mean" "$out" "does not guess"
+  rm -rf "$_rhome" "$_rproj"
+}
+
 test_recipe_book_is_not_compiled_in() {
   _current="bx resolves the shipped recipes with no pi-specific code in bx"
   local out
@@ -980,6 +1027,10 @@ test_recipe_variable_expansion
 test_recipe_unknown_key_is_rejected
 test_recipe_unknown_name_is_rejected
 test_recipe_list
+test_recipe_list_shows_description
+test_recipe_list_marks_machines
+test_recipe_typo_suggests_the_close_name
+test_recipe_typo_far_away_suggests_nothing
 test_recipe_book_is_not_compiled_in
 test_recipe_extends_inherits_scalars_and_lists
 test_recipe_resolver_emits_values
