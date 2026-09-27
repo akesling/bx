@@ -243,10 +243,26 @@ changed, `--reset`, `--status`, `--gc`, `--dry-run`.
 
 The backend is recorded **in** the shape, so a machine built as a vm is never
 silently reused as a container, or the reverse — the runtime that owns the
-mounts is part of what a machine *is*. There is one convenience on top: if a
-recipe names no backend, `smolvm` is on `PATH` nowhere but `podman` is present,
-bx selects `podman` and *says so*. It is never a silent substitution, and
-`--dry-run` prints the chosen backend either way.
+mounts is part of what a machine *is*.  When a recipe names no backend, bx
+does not guess between two runtimes: if exactly one is installed it uses it,
+and if both are the choice is put to you — set `backend_prompt = 1` to be
+asked even when only one is available.
+
+```sh
+bx sandbox                 # no backend named
+#   both smolvm and podman are on PATH, so bx asks:
+#   choose a backend:
+#     [1] smolvm  (microVM)
+#     [2] podman  (container)
+#   > 1
+```
+
+A run that cannot answer the question — a pipe, a CI job, a TTY-less process —
+is an error naming both choices rather than a silent pick. `--dry-run` never
+prompts, because inspection must not block; it prints the backend it would
+choose. To settle the question once and for all, name it in the recipe
+(`backend = podman`) or the environment (`BX_BACKEND=podman`), and bx will not
+ask again.
 
 What this does not do (yet): podman can run many containers under one name and
 bx does not model a *group* of them; volumes are bind mounts, not podman
@@ -444,7 +460,8 @@ a key is read from the environment, as a recipe key, or both; `profile`,
 | `BX_NAME` | both | `bx` | machine name |
 | `BX_CPUS` / `BX_MEM` | both | `4` / `4096` | vCPUs / MiB |
 | `BX_NET` | both | `1` | enable networking |
-| `BX_BACKEND` | both | `smolvm`, or `podman` when smolvm is absent | the runtime that owns the machine: `smolvm` (a microVM) or `podman` (a container) |
+| `BX_BACKEND` | both | — | the runtime that owns the machine: `smolvm` (a microVM) or `podman` (a container). Unset, bx uses the only one installed, and asks when both are (see below) |
+| `BX_BACKEND_PROMPT` | both | `0` | `1` to be asked for the backend even when only one is installed |
 | `BX_MOUNTS` | both | — | newline-separated `HOST:GUEST` pairs |
 | `BX_BOOTSTRAP` | both | — | shell run once in the guest before the command |
 | `BX_PRE_COMMAND` | both | — | host shell run after start, before the bootstrap |

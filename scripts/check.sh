@@ -2,8 +2,11 @@
 # Everything CI and a contributor should run before trusting a change.
 set -eu
 if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck bin/bx install.sh tests/bx_test.sh tests/invariants.sh \
-    scripts/bench.sh scripts/demo.sh scripts/lib.sh
+  # Gate on real problems. shellcheck also emits `info`-level style notes, and
+  # a nonzero exit for one of those would abort this script before the tests
+  # ever ran; the notes are worth seeing, not worth failing on.
+  shellcheck --severity=warning bin/bx install.sh tests/bx_test.sh \
+    tests/invariants.sh scripts/bench.sh scripts/demo.sh scripts/lib.sh
 else
   echo "check: shellcheck not found; skipping lint" >&2
 fi

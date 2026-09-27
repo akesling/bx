@@ -10,6 +10,12 @@
 
 set -uo pipefail
 
+# These tests drive the smolvm lifecycle on a host that (in a real environment)
+# may also have podman installed. Choosing a backend is now a user decision when
+# it is ambiguous, so the harness pins the vm backend here; a recipe's own
+# `backend` key still wins, which is how the container tests run podman.
+export BX_BACKEND=smolvm
+
 _here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _repo_root="$(cd "${_here}/.." && pwd)"
 _bx="${_repo_root}/bin/bx"
@@ -1086,34 +1092,73 @@ STATE
 
 # A recipe that says nothing gets smolvm when smolvm is present, even if
 # podman is too. The backend is only inferred when there is no choice.
-test_backend_prefers_smolvm_when_present() {
-  _current="a recipe with no backend uses smolvm when smolvm is on PATH"
-  local d calls
+test_backend_asks_when_both_are_installed() {
+  _current="with smolvm and podman installed and no choice, bx stops to ask"
+  local d out
   d="$(_new_workdir)"
   : >"$_fake_podman_log"
-  (cd "$d" && BX_NAME=prefinv BX_MOUNTS="/only:/only" \
+  # Both are available on PATH and no backend is named. Without a terminal the
+  # prompt cannot be answered, so bx must fail naming both choices rather than
+  # silently picking one.
+  out="$(cd "$d" && env -u BX_BACKEND BX_NAME=amb BX_MOUNTS="/only:/only" \
     BX_COMMAND="true" BX_STATE_DIR="$d/local" FAKE_VMS= \
-    PATH="${_fake_bin_dir}:${_fake_podman_dir}:$PATH" "$_bx" >/dev/null 2>&1)
-  calls="$(cat "$_fake_podman_log" 2>/dev/null)"
-  assert_eq "" "$calls" "no podman was invoked"
+    PATH="${_fake_bin_dir}:${_fake_podman_dir}:$PATH" "$_bx" 2>&1)"
+  assert_contains "not interactive" "$out" "refuses to guess without a terminal"
+  assert_contains "backend = smolvm" "$out" "offers smolvm"
+  assert_contains "backend = podman" "$out" "offers podman"
   rm -rf "$d"
 }
 
-# Inside a machine there is no smolvm and podman is present: the backend is
-# inferred, used, and *said* — never a silent substitution.
-test_backend_infers_podman_without_smolvm() {
-  _current="with no smolvm but podman, the container backend is chosen and named"
+# Exactly one backend installed and no request to be asked: using it is not a
+# guess, so bx proceeds without a prompt.
+test_backend_uses_the_only_installed_backend() {
+  _current="with no smolvm and only podman, the container backend is chosen"
   local d out calls
   d="$(_new_workdir)"
   : >"$_fake_podman_log"
-  out="$(cd "$d" && BX_VERBOSE=1 BX_NAME=infonly BX_MOUNTS="/only:/only" \
+  # No explicit backend: the harness exports BX_BACKEND=smolvm, so unset it to
+  # exercise the auto-choice. Only podman is on PATH, so no prompt is needed.
+  out="$(cd "$d" && env -u BX_BACKEND BX_VERBOSE=1 BX_NAME=infonly BX_MOUNTS="/only:/only" \
     BX_COMMAND="true" BX_STATE_DIR="$d/local" \
     PATH="${_fake_podman_dir}:/usr/bin:/bin" "$_bx" 2>&1)"
   calls="$(cat "$_fake_podman_log" 2>/dev/null)"
-  assert_contains "using backend 'podman'" "$out" "says which backend it chose"
   assert_contains "exec" "$calls" "runs through podman"
   rm -rf "$d"
 }
+
+# `backend_prompt` is the escape hatch: even with a single backend installed,
+# ask rather than choose. Without a terminal that is a hard error, which is how
+# the test observes that the prompt path was taken.
+test_backend_prompt_forces_a_question() {
+  _current="backend_prompt asks even when only one backend is installed"
+  local d out
+  d="$(_new_workdir)"
+  out="$(cd "$d" && env -u BX_BACKEND BX_BACKEND_PROMPT=1 BX_NAME=forced \
+    BX_MOUNTS="/only:/only" BX_COMMAND="true" BX_STATE_DIR="$d/local" \
+    PATH="${_fake_podman_dir}:/usr/bin:/bin" "$_bx" 2>&1)"
+  assert_contains "not interactive" "$out" "asks despite a single backend"
+  rm -rf "$d"
+}
+
+# An explicit choice is never questioned: a recipe that names smolvm must not
+# prompt even when both are installed.
+test_explicit_backend_never_prompts() {
+  _current="an explicit backend is used without asking"
+  local d out
+  d="$(_new_workdir)"
+  cat >"$d/.bx.conf" <<'CONF'
+[explicit]
+backend = smolvm
+image   = debian:bookworm-slim
+mounts  = /only:/only
+command = true
+CONF
+  out="$(cd "$d" && env -u BX_BACKEND BX_NAME=ex BX_STATE_DIR="$d/local" FAKE_VMS= \
+    PATH="${_fake_bin_dir}:${_fake_podman_dir}:$PATH" "$_bx" explicit 2>&1)"
+  assert_not_contains "not interactive" "$out" "did not ask"
+  rm -rf "$d"
+}
+
 
 # A secret crosses by name on both backends: podman has no --secret-env, so bx
 # uses `-e GUEST` and exports the host variable. The value must never appear in
@@ -1184,6 +1229,18 @@ CONF
   rm -rf "$d"
 }
 
+test_backends_implement_the_same_verbs() {
+  _current="every backend implements the same lifecycle verbs"
+  local _sm _pd
+  _sm="$(grep -oE '^bk_smolvm_[a-z_]+' "$_bx" | sed 's/^bk_smolvm_//' | sort)"
+  _pd="$(grep -oE '^bk_podman_[a-z_]+' "$_bx" | sed 's/^bk_podman_//' | sort)"
+  if [[ -z "$_sm" ]]; then
+    _fail "no smolvm backend verbs found; did the naming scheme change?"
+    return
+  fi
+  assert_eq "$_sm" "$_pd" "backends disagree on the verb set"
+}
+
 _install_fake_smolvm
 trap '_remove_fake_smolvm; _remove_fake_podman' EXIT
 
@@ -1245,11 +1302,18 @@ test_gc_keeps_live_machine
 test_old_state_file_still_reuses
 test_container_backend_creates_and_execs
 test_backend_is_part_of_the_shape
-test_backend_prefers_smolvm_when_present
-test_backend_infers_podman_without_smolvm
+test_backend_asks_when_both_are_installed
+test_backend_uses_the_only_installed_backend
+test_backend_prompt_forces_a_question
+test_explicit_backend_never_prompts
 test_container_backend_secret_stays_out_of_argv
 test_dry_run_reports_backend
 test_unknown_backend_is_rejected
+
+# The engine is only unified if every backend implements the same verbs. A new
+# backend that forgets one would fail at the call site, deep in a run; catch it
+# here, where the fix is obvious.
+test_backends_implement_the_same_verbs
 
 printf '\n%d passed, %d failed\n' "$_passed" "$_failed"
 [[ "$_failed" -eq 0 ]]

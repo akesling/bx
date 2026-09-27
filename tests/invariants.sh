@@ -99,7 +99,7 @@ secret_env = API_KEY=THE_SECRET_VAR:ephemeral
 command  = true
 CONF
   out="$(cd "$d" && THE_SECRET_VAR="$_sentinel" BX_NAME=secinv \
-    BX_STATE_DIR="$d/state" PATH="$d/bin:$PATH" "$_bx" sec 2>&1)"
+    BX_BACKEND=smolvm BX_STATE_DIR="$d/state" PATH="$d/bin:$PATH" "$_bx" sec 2>&1)"
   # The recorded argv (calls.log) must name THE_SECRET_VAR, never its value.
   assert_present "THE_SECRET_VAR" "$(cat "$log" 2>/dev/null)" "the secret was not passed by name"
   assert_absent "$_sentinel" "$(cat "$log" 2>/dev/null)" "argv leaked the secret"
@@ -150,7 +150,7 @@ mounts  = /tmp:/work
 command = true
 CONF
   # A fresh machine name: the run will create it, which is the noisy path.
-  err="$(cd "$d" && BX_NAME=quietinv BX_STATE_DIR="$d/state" \
+  err="$(cd "$d" && BX_NAME=quietinv BX_BACKEND=smolvm BX_STATE_DIR="$d/state" \
     PATH="$d/bin:$PATH" "$_bx" quiet 2>&1 >/dev/null)"
   assert_absent "creating" "$err" "piped run leaked create narration"
   assert_absent "bx:" "$err" "piped run leaked a bx-prefixed line"
@@ -183,7 +183,7 @@ command = true
 CONF
   (cd "$d" && TERM=xterm-color LANG=en_US.UTF-8 TZ=UTC \
      AWS_SECRET_ACCESS_KEY="$_sentinel" EDITOR=vim \
-     BX_NAME=envinv BX_STATE_DIR="$d/state" PATH="$d/bin:$PATH" \
+     BX_NAME=envinv BX_BACKEND=smolvm BX_STATE_DIR="$d/state" PATH="$d/bin:$PATH" \
      "$_bx" env >/dev/null 2>&1)
   local calls
   calls="$(cat "$log" 2>/dev/null)"
@@ -281,7 +281,8 @@ test_boot_probe_accepts_macos() {
   fi
 
   # With no smolvm on PATH, no host is bootable.
-  PATH="/nonexistent-bx-" 
+  # shellcheck disable=SC2123  # overriding PATH is the point here
+  PATH="/nonexistent-bx-"
   if BX_HOST_OS=Darwin _smolvm_can_boot; then
     _fail "Darwin without smolvm must NOT be bootable"
   else
@@ -327,8 +328,8 @@ test_backend_choice_is_documented() {
     _fail "recipes/README.md no longer lists the backend key"
     return
   fi
-  if ! grep -qF 'never a silent substitution' "$_readme"; then
-    _fail "README no longer states that an inferred backend is always announced"
+  if ! grep -qiE 'is an error naming both choices|never a silent substitution' "$_readme"; then
+    _fail "README no longer states that an unresolved backend choice is an error, not a silent pick"
     return
   fi
   _pass
@@ -342,7 +343,7 @@ test_real_home_is_not_mounted() {
   local d out
   d="$(_new_tmp)"
   printf 'sentinel\n' >"${HOME}/.bx-invariants-sentinel"
-  out="$(cd "$d" && BX_NAME=inv-home BX_COMMAND="cat \$HOME/.bx-invariants-sentinel 2>&1 || true" \
+  out="$(cd "$d" && BX_NAME=inv-home BX_BACKEND=smolvm BX_COMMAND="cat \$HOME/.bx-invariants-sentinel 2>&1 || true" \
     BX_STATE_DIR="$d/state" BX_KEEP=0 "$_bx" 2>&1)"
   assert_absent "sentinel" "$out" "the guest read a host home-directory file"
   rm -f "${HOME}/.bx-invariants-sentinel"
@@ -355,7 +356,7 @@ test_real_project_is_mounted() {
   _current="the project directory is writable inside the guest"
   local d out
   d="$(_new_tmp)"
-  out="$(cd "$d" && BX_NAME=inv-proj \
+  out="$(cd "$d" && BX_NAME=inv-proj BX_BACKEND=smolvm \
     BX_COMMAND="echo from-guest > /work/invariants-probe && cat /work/invariants-probe" \
     BX_STATE_DIR="$d/state" "$_bx" 2>&1)"
   assert_present "from-guest" "$out" "the guest could not write the mount"

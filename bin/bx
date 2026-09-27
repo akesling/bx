@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# bx — run a named recipe inside a smolvm microVM with host directories mounted.
+# bx — run a named recipe inside a microVM or a container, with host
+# directories mounted.
 #
 # Usage:
 #   bx <recipe> [args...]   # run a recipe (e.g. `bx pi`)
-#   bx -v <recipe>          # also show the smolvm commands bx runs
+#   bx -v <recipe>          # also show the lifecycle commands bx runs
 #   bx -q <recipe>          # errors only
 #   bx --list               # list available recipes
 #   bx --show <recipe>      # print the resolved recipe, with provenance
@@ -46,10 +47,14 @@
 # Recipe keys (every bx setting, plus four):
 #   command, image, name, cpus, mem, net, mounts, workdir, keep, reset,
 #   bootstrap, bootstrap_env, secret_env, pre_command, name, state_dir,
-#   backend, profile, extends, resolve, machine
-# `backend` is the runtime that owns the machine: `smolvm` (a microVM; the
-# default) or `podman` (a container; use it inside a machine, where a vm
-# cannot boot). It is part of the shape, so changing it forces a recreate.
+#   backend, backend_prompt, profile, extends, resolve, machine
+# `backend` is the runtime that owns the machine: `smolvm` (a microVM) or
+# `podman` (a container; use it inside a machine, where a vm cannot boot). It
+# is part of the shape, so changing it forces a recreate. When it is not set,
+# bx uses the only runtime installed and asks when both are; `backend_prompt = 1`
+# forces the question even when only one is available. A run that cannot answer
+# the question (no terminal) is an error naming both choices, never a silent
+# pick; `--dry-run` reports the choice a run would make.
 # `mounts`, `bootstrap_env`, and `secret_env` may repeat; their lines are kept
 # in order. `#` starts a comment; values run to end of line after trimming. A
 # value continues on following lines if those lines are indented.
@@ -72,6 +77,7 @@
 # lifetimes are recorded too, so `--status` and `--gc` can report and reclaim
 # machines, and so a run can warn before it persists a secret.
 
+# shellcheck disable=SC2317  # backend verbs are dispatched indirectly by _bk
 set -euo pipefail
 
 _die() { printf 'bx: %s\n' "$*" >&2; exit 1; }
@@ -104,6 +110,7 @@ fi
 _run_note() { [[ "$_run_verbosity" -ge 1 ]] && printf 'bx: %s\n' "$*" >&2 || true; }
 _run_say()  { [[ "$_run_verbosity" -ge 1 ]] && printf '%s\n'    "$*" >&2 || true; }
 
+
 # Host environment a program expects to inherit, so a command inside the
 # machine behaves as it does on the host for the things a user controls:
 # terminal type, locale, and colour. Only these are forwarded. The fence is
@@ -132,6 +139,411 @@ _quiet_or_die() {
   fi
 }
 
+# ── the backend engine ──────────────────────────────────────────────────────
+# A machine is a microVM (smolvm) or a container (podman). bx's lifecycle —
+# exists, create, start, stop, delete, exec, size — is identical either way;
+# only the program and its argument shape differ. So a backend is *declared*
+# once, as a small descriptor, and every call site in bx goes through the
+# generic wrappers below. Adding a runtime is adding a descriptor and its
+# verb functions; no caller names a runtime.
+#
+# The descriptor is the contract a backend must satisfy:
+#
+#   `_BACKEND_PROGRAMS[i]`  the program on PATH, e.g. `smolvm`
+#   `_BACKEND_LABELS[i]`    the noun a person reads: `microVM` or `container`
+#   `bk_<name>_exists`     is there a machine by this name?
+#   `bk_<name>_create_args` build the create argv into `_create_args`
+#   `bk_<name>_create`     create it (uses `_create_args`)
+#   `bk_<name>_start`      start it
+#   `bk_<name>_stop`       stop it
+#   `bk_<name>_delete`     delete it, forcibly
+#   `bk_<name>_exec`       exec a command, given a tty flag and the command
+#   `bk_<name>_exec_bootstrap`  run the bootstrap before the command
+#   `bk_<name>_env_arg`    append one bootstrap `--env` pair to `_bootstrap_env_args`
+#   `bk_<name>_passthrough_arg`  append one forwarded `--env` pair to `_passthrough_env_args`
+#   `bk_<name>_secret_arg` append one secret to `_secret_args` (name, not value)
+#   `bk_<name>_secret_export`   print 1 if the value must be exported by bx
+#   `bk_<name>_size`       a human size for one machine, or `?`
+#   `bk_<name>_image_cached`      is the image already in its store?
+#   `bk_<name>_toolchain_present` is the baked toolchain in its writable layer?
+#
+# bash 3.2 has no associative arrays, so parallel arrays keyed by name stand
+# in. The table is closed: a name not declared is rejected, because silently
+# picking a runtime is precisely the substitution this tool exists to prevent.
+_BACKEND_NAMES=()
+_BACKEND_PROGRAMS=()
+_BACKEND_LABELS=()
+_bk_declare() { # name program label
+  _BACKEND_NAMES+=("$1"); _BACKEND_PROGRAMS+=("$2"); _BACKEND_LABELS+=("$3")
+}
+_bk_program() { # name -> program
+  local _i
+  for _i in "${!_BACKEND_NAMES[@]}"; do
+    [[ "${_BACKEND_NAMES[$_i]}" == "$1" ]] && { printf '%s' "${_BACKEND_PROGRAMS[$_i]}"; return 0; }
+  done
+  return 1
+}
+_bk_label() { # name -> the noun a person reads
+  local _i
+  for _i in "${!_BACKEND_NAMES[@]}"; do
+    [[ "${_BACKEND_NAMES[$_i]}" == "$1" ]] && { printf '%s' "${_BACKEND_LABELS[$_i]}"; return 0; }
+  done
+  return 1
+}
+_bk_known() { _bk_program "$1" >/dev/null 2>&1; }
+_bk_available() { _bk_known "$1" && command -v "$(_bk_program "$1")" >/dev/null 2>&1; }
+# Dispatch one verb to the chosen backend: every verb is a function named
+# `bk_<backend>_<verb>`, so the wrapper is uniform and no call site branches on
+# the runtime's name.
+_bk() { # verb [args...]
+  local _verb="$1"; shift
+  "bk_${_backend}_${_verb}" "$@"
+}
+_bk_declare smolvm smolvm "microVM"
+_bk_declare podman podman "container"
+
+# ── choosing the backend ────────────────────────────────────────────────────
+# The backend is a property of the machine (it is in the shape), so it is
+# chosen before anything is created. The rules, in order:
+#
+#   1. An explicit `backend` / `BX_BACKEND` always wins. No prompt.
+#   2. Else if `backend_prompt` / `BX_BACKEND_PROMPT` is set, ask — the
+#      "always prompt" switch, for people who never want bx to pick.
+#   3. Else if the choice is *ambiguous* (more than one backend installed),
+#      ask: two runtimes on the host is a real choice, and guessing one is how
+#      a container quietly becomes the machine you meant to be a vm.
+#   4. Else auto-choose the only one available.
+#
+# A prompt that cannot be answered is a hard error naming both choices, never
+# a silent fall back: a non-interactive run (a pipe, CI) must not have a
+# runtime chosen *for* it. `--dry-run` never prompts — it is inspection, and
+# it must stay runnable with no backend installed at all.
+
+_backend_available_list() { # names available on PATH, one per line
+  local _n
+  for _n in "${_BACKEND_NAMES[@]}"; do
+    _bk_available "$_n" && printf '%s\n' "$_n"
+  done
+}
+
+# Ask a person to choose. Reads from the terminal, not stdin, so a piped
+# command's input is untouched. Dies, naming the choices, when there is no
+# terminal to ask.
+_backend_choose_interactively() { # available names as args
+  # A run with no controlling terminal cannot answer, and it must not have a
+  # runtime picked for it. Fail with both choices named, so a log or a CI job
+  # carries the fix rather than a mystery.
+  if ! { exec 3</dev/tty; } 2>/dev/null; then
+    _die "no backend chosen and this run is not interactive.
+Install a runtime, or set the backend explicitly:
+$(for _n in "$@"; do printf '  backend = %s   (%s)\n' "$_n" "$(_bk_label "$_n")"; done)"
+  fi
+  exec 3<&-
+  local _choice _n _i
+  while true; do
+    printf 'bx: no backend chosen; which should own this machine?\n' >&2
+    _i=0
+    for _n in "$@"; do
+      _i=$((_i + 1))
+      printf '  [%s] %s  (%s)\n' "$_i" "$_n" "$(_bk_label "$_n")" >&2
+    done
+    printf 'Choose one [1-%s] (or Ctrl-C): ' "$_i" >&2
+    read -r _choice </dev/tty || _die "no choice made"
+    [[ -n "$_choice" ]] || continue
+    # Accept a number, or the name (or its first letter, when unambiguous).
+    if [[ "$_choice" =~ ^[0-9]+$ ]] && (( _choice >= 1 && _choice <= _i )); then
+      _i=0
+      for _n in "$@"; do
+        _i=$((_i + 1))
+        [[ "$_i" == "$_choice" ]] && { printf '%s' "$_n"; return 0; }
+      done
+    fi
+    for _n in "$@"; do
+      [[ "$_n" == "$_choice" || "${_n:0:1}" == "$_choice" ]] && { printf '%s' "$_n"; return 0; }
+    done
+    printf 'bx: %s is not one of the choices\n' "$_choice" >&2
+  done
+}
+
+# Runs once the inspection subcommands (`--status`, `--gc`, `--show`) have had
+# their chance to exit: those read a machine's recorded backend and must not
+# trigger the choice. Everything the lifecycle needs is set here.
+_choose_backend() {
+  # Read the decision inputs here, not at parse time: a recipe's `backend` and
+  # `backend_prompt` keys are applied during recipe resolution, which runs
+  # before this function is called but after the engine block is read.
+  local _backend_explicit="${BX_BACKEND:-}"
+  local _backend_ask="${BX_BACKEND_PROMPT:-0}"
+
+  # 1. Explicit choice: use it. This is the only path that never prompts.
+  if [[ -n "$_backend_explicit" ]]; then
+    _bk_known "$_backend_explicit" || \
+      _die "unknown backend '$_backend_explicit' (expected one of: $(printf '%s ' "${_BACKEND_NAMES[@]}"))"
+    _backend="$_backend_explicit"
+    _backend_present=1
+    _bk_available "$_backend" || _backend_present=0
+    return 0
+  fi
+
+  # No explicit choice. What is actually installed decides what can be asked.
+  local _available _n_available
+  _n_available=0
+  # Count the newline-separated list *before* joining it, or `wc -l` sees a
+  # single line and every ambiguity looks like a lone backend.
+  while IFS= read -r _one; do
+    [[ -n "$_one" ]] && _n_available=$((_n_available + 1))
+  done < <(_backend_available_list)
+  _available="$(_backend_available_list | tr '\n' ' ')"
+  _available="${_available% }"
+
+  if [[ "$_n_available" == "0" ]]; then
+    _die "no backend installed: none of $(printf '%s ' "${_BACKEND_NAMES[@]}")is on PATH.
+Install smolvm (a microVM) or podman (a container), then run again."
+  fi
+
+  # `--dry-run` is inspection: it must not block on a prompt. Pick the
+  # documented preference (smolvm) and let the plan say so.
+  if [[ "$_dry_run" == "1" ]]; then
+    if _bk_available smolvm; then _backend="smolvm"; else _backend="${_available%% *}"; fi
+    _backend_present=1
+    return 0
+  fi
+
+  # 2. `backend_prompt` set, or the choice is ambiguous (more than one backend
+  #    installed): ask, never guess. A non-interactive run is a hard error.
+  if [[ "$_backend_ask" == "1" || "$_backend_ask" == "true" || "$_n_available" -gt 1 ]]; then
+    # Word-split on purpose: the names are shell identifiers, and the prompt
+    # wants each as its own argument so it can number them.
+    # shellcheck disable=SC2086
+    _backend="$(_backend_choose_interactively $_available)"
+    _backend_present=1
+    return 0
+  fi
+
+  # 3. Exactly one backend available and no request to be asked: use it.
+  _backend="$_available"
+  _backend_present=1
+}
+
+# Does a machine with this name already exist, according to the backend?
+_machine_exists() {
+  [[ "$_backend_present" == "1" ]] || return 1
+  _bk exists
+}
+
+# ── backend verbs ───────────────────────────────────────────────────────────
+# One function per lifecycle step, dispatching on the backend. The call sites
+# below never name a runtime, so a new backend is added here and nowhere else.
+# The two backends differ in more than spelling, and the differences are
+# deliberate:
+#
+#   mounts   smolvm binds a host directory into the vm (`--volume H:G`);
+#            podman bind-mounts it (`-v H:G`). Same pair grammar.
+#   net      smolvm needs `--net` to enable it; a container is on the default
+#            bridge unless told `--network=none`.
+#   secrets  smolvm takes `--secret-env GUEST=HOST`; a container takes
+#            `-e GUEST`, inheriting the value from the exec's environment,
+#            which bx sets from the host variable by name. Either way the
+#            value never lands in argv — only the name does.
+#   image    smolvm pulls and unpacks a rootfs; podman pulls an image.
+#
+# smolvm: one machine, one vm. The program's subcommands are `machine <verb>`.
+
+bk_smolvm_exists() {
+  smolvm machine ls -q 2>/dev/null | grep -qx "$_vm_name"
+}
+
+bk_smolvm_create() {
+  _quiet_or_die "could not create machine $_vm_name" \
+    smolvm machine create "${_create_args[@]}"
+}
+
+bk_smolvm_start() {
+  _quiet_or_die "machine '$_vm_name' failed to start. If its mounts or image changed
+since it was created, recreate it: bx --reset" \
+    smolvm machine start --name "$_vm_name"
+}
+
+bk_smolvm_stop() { _quiet smolvm machine stop --name "$_vm_name" || true; }
+
+bk_smolvm_delete() { _quiet smolvm machine delete --name "$_vm_name" -f || true; }
+
+# The env args are rendered for the backend by the caller, so this only picks
+# the program and the exec form. smolvm needs `--` before the command.
+# shellcheck disable=SC2086,SC2068  # deliberate word-splitting of the arg arrays
+bk_smolvm_exec() { # tty(0|1) command
+  local _tty="$1" _cmd="$2"
+  if [[ "$_tty" == "1" ]]; then
+    smolvm machine exec --name "$_vm_name" -i -t \
+      ${_secret_args[@]+"${_secret_args[@]}"} \
+      ${_passthrough_env_args[@]+"${_passthrough_env_args[@]}"} \
+      -- bash -lc "$_cmd"
+  else
+    smolvm machine exec --name "$_vm_name" \
+      ${_secret_args[@]+"${_secret_args[@]}"} \
+      ${_passthrough_env_args[@]+"${_passthrough_env_args[@]}"} \
+      -- bash -lc "$_cmd"
+  fi
+}
+
+bk_smolvm_size() { # machine name -> bytes-ish human string, or ?
+  local _dir="${SMOLVM_STORAGE:-/storage}/overlays/persistent-$1"
+  if [[ -d "$_dir" ]]; then du -sh "$_dir" 2>/dev/null | cut -f1; else printf '?'; fi
+}
+
+# How a secret crosses: smolvm resolves HOST itself, so the value is never in
+# bx's environment. Appends to `_secret_args` (the caller's array) and answers
+# whether the host variable must be exported.
+bk_smolvm_secret_arg() { _secret_args+=(--secret-env "${_secret_guest}=${_secret_host}"); }
+bk_smolvm_secret_export() { printf '0'; }
+
+# Build the create argv for a machine. Reads `_vm_name`, `_image`, `_vm_cpus`,
+# `_vm_mem`, `_net`, `_want_mounts`; writes `_create_args`.
+bk_smolvm_create_args() {
+  _create_args=(--name "$_vm_name" --image "$_image" --cpus "$_vm_cpus" --mem "$_vm_mem")
+  [[ "$_net" == "1" ]] && _create_args+=(--net)
+  local _mount
+  while IFS= read -r _mount; do
+    [[ -n "$_mount" ]] || continue
+    _create_args+=(--volume "$_mount")
+  done < <(printf '%s\n' "$_want_mounts")
+}
+
+# smolvm spells both bootstrap env and host passthrough `--env NAME=VALUE`.
+bk_smolvm_env_arg() { _bootstrap_env_args+=(--env "$1"); }
+bk_smolvm_passthrough_arg() { _passthrough_env_args+=(--env "$1"); }
+
+# The bootstrap is a non-login exec; smolvm takes `--` before the command.
+# shellcheck disable=SC2086,SC2068
+bk_smolvm_exec_bootstrap() {
+  smolvm machine exec --name "$_vm_name" \
+    ${_secret_args[@]+"${_secret_args[@]}"} \
+    ${_bootstrap_env_args[@]+"${_bootstrap_env_args[@]}"} \
+    -- bash -c "$BX_BOOTSTRAP"
+}
+
+bk_smolvm_image_cached() { # image -> cached|not cached|unknown
+  local _root="${SMOLVM_STORAGE:-/storage}"
+  local _safe; _safe="$(printf '%s' "$1" | sed 's#[/:]#_#g')"
+  if [[ -d "$_root/manifests" ]]; then
+    [[ -f "$_root/manifests/${_safe}.json" ]] && { printf 'cached'; return 0; }
+    printf 'not cached'; return 0
+  fi
+  printf 'unknown'
+}
+
+bk_smolvm_toolchain_present() {
+  local _upper="${SMOLVM_STORAGE:-/storage}/overlays/persistent-${_vm_name}/upper"
+  if [[ -d "$_upper" ]]; then
+    if [[ -e "$_upper/root/.bun" || -e "$_upper/usr/local/bin/pi" ]]; then
+      printf 'present'; return 0
+    fi
+    printf 'absent'; return 0
+  fi
+  printf 'unknown'
+}
+
+# podman: one container per name. `ps -a` includes stopped ones, because a
+# stopped machine is still the directory's machine (bx starts it again).
+
+bk_podman_exists() {
+  podman ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$_vm_name"
+}
+
+bk_podman_create() {
+  _quiet_or_die "could not create container $_vm_name" \
+    podman create "${_create_args[@]}"
+}
+
+bk_podman_start() {
+  _quiet_or_die "container '$_vm_name' failed to start. If its mounts or image changed
+since it was created, recreate it: bx --reset" \
+    podman start "$_vm_name"
+}
+
+bk_podman_stop() { _quiet podman stop "$_vm_name" || true; }
+
+bk_podman_delete() { _quiet podman rm -f "$_vm_name" || true; }
+
+# shellcheck disable=SC2086,SC2068  # deliberate word-splitting of the arg arrays
+bk_podman_exec() { # tty(0|1) command
+  local _tty="$1" _cmd="$2"
+  if [[ "$_tty" == "1" ]]; then
+    podman exec -i -t \
+      ${_secret_args[@]+"${_secret_args[@]}"} \
+      ${_passthrough_env_args[@]+"${_passthrough_env_args[@]}"} \
+      "$_vm_name" bash -lc "$_cmd"
+  else
+    podman exec -i \
+      ${_secret_args[@]+"${_secret_args[@]}"} \
+      ${_passthrough_env_args[@]+"${_passthrough_env_args[@]}"} \
+      "$_vm_name" bash -lc "$_cmd"
+  fi
+}
+
+bk_podman_size() { # container name -> writable size, or ?
+  local _s
+  _s="$(podman ps -a --size --filter "name=^$1$" --format '{{.Size}}' 2>/dev/null | head -1)"
+  _s="${_s%% *}"
+  printf '%s' "${_s:-?}"
+}
+
+# podman has no --secret-env; bx exports the host variable and asks for `-e`
+# on the guest name, so only the name reaches argv.
+bk_podman_secret_arg() { _secret_args+=(-e "${_secret_guest}"); }
+bk_podman_secret_export() { printf '1'; }
+
+# Build the create argv. A container runs until its command exits; bx execs
+# into it repeatedly, so it is created with a long-lived command and stopped by
+# `podman stop`. `--entrypoint ''` plus `sleep infinity` gives exactly that.
+bk_podman_create_args() {
+  _create_args=(--name "$_vm_name" --cpus "$_vm_cpus" --memory "${_vm_mem}m")
+  [[ "$_net" == "0" ]] && _create_args+=(--network=none)
+  local _mount
+  while IFS= read -r _mount; do
+    [[ -n "$_mount" ]] || continue
+    _create_args+=(-v "$_mount")
+  done < <(printf '%s\n' "$_want_mounts")
+  _create_args+=(--entrypoint '' "$_image" sleep infinity)
+}
+
+# A container spells env as `-e`.
+bk_podman_env_arg() { _bootstrap_env_args+=(-e "$1"); }
+bk_podman_passthrough_arg() { _passthrough_env_args+=(-e "$1"); }
+
+# shellcheck disable=SC2086,SC2068
+bk_podman_exec_bootstrap() {
+  podman exec -i \
+    ${_secret_args[@]+"${_secret_args[@]}"} \
+    ${_bootstrap_env_args[@]+"${_bootstrap_env_args[@]}"} \
+    "$_vm_name" bash -c "$BX_BOOTSTRAP"
+}
+
+bk_podman_image_cached() { # image -> cached|not cached|unknown
+  if podman image exists "$1" 2>/dev/null; then printf 'cached'; else printf 'not cached'; fi
+}
+
+bk_podman_toolchain_present() {
+  # A container's writable layer is podman's, and bx does not read inside it.
+  printf 'unknown'
+}
+
+# ── generic verb wrappers ───────────────────────────────────────────────────
+# Every call site below uses these; none names a runtime. `_bk <verb>` dispatches
+# by the chosen backend's name to the `bk_<backend>_<verb>` function above.
+_backend_create() { _bk create; }
+_backend_start()  { _bk start; }
+_backend_stop()   { _bk stop; }
+_backend_delete() { _bk delete; }
+_backend_exec()   { _bk exec "$@"; }
+_backend_image_cached()    { _bk image_cached "$1"; }
+_backend_toolchain_present() { _bk toolchain_present; }
+_backend_create_args() { _bk create_args; }
+_backend_env_arg()     { _bk env_arg "$1"; }
+_backend_passthrough_arg() { _bk passthrough_arg "$1"; }
+_backend_exec_bootstrap() { _bk exec_bootstrap; }
+_backend_secret_export() { _bk secret_export; }
+
 _usage() {
   sed -n '2,70p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
@@ -147,7 +559,7 @@ _usage() {
 # last file read wins) and appends to a multi-valued key (so all sources
 # contribute, in the order read: home, project, per-recipe).
 
-_recipe_keys="command image name cpus mem net mounts workdir keep reset bootstrap bootstrap_env secret_env pre_command state_dir backend profile extends resolve machine"
+_recipe_keys="command image name cpus mem net mounts workdir keep reset bootstrap bootstrap_env secret_env pre_command state_dir backend backend_prompt profile extends resolve machine"
 _multi_keys="mounts bootstrap_env secret_env"
 
 # A recipe key that is not a bx setting but describes the recipe itself.
@@ -770,6 +1182,7 @@ _apply_recipe_key() { # key value
     pre_command)   BX_PRE_COMMAND="$_val" ;;
     state_dir)     BX_STATE_DIR="$_val" ;;
     backend)       BX_BACKEND="$_val" ;;
+    backend_prompt) BX_BACKEND_PROMPT="$_val" ;;
     profile)       BX_PROFILE="$_val" ;;
   esac
 }
@@ -786,7 +1199,11 @@ _dump_recipe() {
   printf 'recipe=%s\n' "$_name"
   printf 'command=%s\n' "${BX_COMMAND:-}"
   printf 'image=%s\n' "${BX_IMAGE:-debian:bookworm-slim}"
-  printf 'backend=%s\n' "${BX_BACKEND:-smolvm}"
+  # `--show` does not pick a backend (it exits before the choice), so do not
+  # imply one was chosen. Unset means the run will ask or use the only one
+  # installed; naming smolvm here would be a claim `--show` cannot make.
+  printf 'backend=%s\n' "${BX_BACKEND:-(unchosen; see --dry-run)}"
+  printf 'backend_prompt=%s\n' "${BX_BACKEND_PROMPT:-0}"
   printf 'name=%s\n' "${BX_NAME:-bx}"
   printf 'cpus=%s\n' "${BX_CPUS:-4}"
   printf 'mem=%s\n' "${BX_MEM:-4096}"
@@ -952,9 +1369,10 @@ _state_block() { # statefile key
 
 # `--status` prints one machine per block: the recorded shape summary, the
 # origin directory, whether that directory still exists (so the machine is
-# reclaimable), whether it is running according to smolvm, and how big its
-# private state is. This is the answer to "what exists, where, and from
-# where" that the lifecycle otherwise leaves implicit.
+# reclaimable), whether the backend still knows it, and how big its private
+# state is. This is the answer to "what exists, where, and from where" that
+# the lifecycle otherwise leaves implicit. Each machine is read from its own
+# recorded backend, so a vm and a container can be listed side by side.
 _status_action() {
   local _name _file _origin _dir_ok _running _lifetimes _size _found=0 _b
   while IFS= read -r _name; do
@@ -965,42 +1383,26 @@ _status_action() {
     _dir_ok="gone"
     [[ -n "$_origin" && -d "$_origin" ]] && _dir_ok="present"
     # The backend is recorded in the state file, so a machine created as a vm
-    # is queried as a vm even on a host where podman is the default. A machine
-    # from before `backend` existed is a smolvm one.
+    # is queried as a vm even on a host where a container is the default. A
+    # machine from before `backend` existed is a smolvm one.
     _b="$(_state_field "$_file" backend)"
     [[ -n "$_b" ]] || _b="smolvm"
+    # Answer from the machine's own backend, by pointing the engine at it.
+    _vm_name="$_name"
     _running="stopped"
-    case "$_b" in
-      podman)
-        if command -v podman >/dev/null 2>&1 && \
-           podman ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$_name"; then
-          _running="exists"
-        fi ;;
-      *)
-        if command -v smolvm >/dev/null 2>&1 && \
-           smolvm machine ls -q 2>/dev/null | grep -qx "$_name"; then
-          _running="exists"
-        fi ;;
-    esac
+    if _bk_available "$_b" && _bk_known "$_b"; then
+      _backend="$_b"
+      _bk exists && _running="exists"
+    fi
     _lifetimes="$(_state_block "$_file" secret_lifetimes)"
     _lifetimes="${_lifetimes//$'\n'/, }"
     _size="?"
-    case "$_b" in
-      podman)
-        # podman reports a container's writable size only with `--size`, and
-        # the value is the rw layer, not the image. Report it when we can, and
-        # an honest `?` when we cannot — never a guessed number.
-        if command -v podman >/dev/null 2>&1; then
-          _size="$(podman ps -a --size --filter "name=^${_name}$" --format '{{.Size}}' 2>/dev/null | head -1)"
-          _size="${_size%% *}"
-          [[ -n "$_size" ]] || _size="?"
-        fi ;;
-      *)
-        _size_dir="${SMOLVM_STORAGE:-/storage}/overlays/persistent-${_name}"
-        [[ -d "$_size_dir" ]] && _size="$(du -sh "$_size_dir" 2>/dev/null | cut -f1)" ;;
-    esac
+    if _bk_available "$_b" && _bk_known "$_b"; then
+      _backend="$_b"
+      _size="$(_bk size "$_name")"
+    fi
     printf 'machine:  %s\n' "$_name"
-    printf 'backend:  %s\n' "$_b"
+    printf 'backend:  %s (%s)\n' "$_b" "$(_bk_label "$_b" 2>/dev/null || printf unknown)"
     printf 'image:    %s\n' "$(_state_field "$_file" image)"
     printf 'origin:   %s (%s)\n' "${_origin:-(unknown)}" "$_dir_ok"
     printf 'runtime:  %s\n' "$_running"
@@ -1017,6 +1419,8 @@ _status_action() {
 # the plan first and only acts with `--yes`, because deletion is the one thing
 # here that is not reversible by reading state. A machine kept running on
 # purpose (`--keep`) is reclaimed too: its origin is gone, so it is orphaned.
+# Deletion goes through the machine's own backend, so a container is reclaimed
+# with `podman rm` and a vm with `smolvm machine delete` without a branch here.
 _gc_action() {
   local _name _file _origin _reclaim=0 _b
   while IFS= read -r _name; do
@@ -1029,18 +1433,15 @@ _gc_action() {
     _b="$(_state_field "$_file" backend)"
     [[ -n "$_b" ]] || _b="smolvm"
     _reclaim=$((_reclaim + 1))
-    printf 'reclaim: %s (%s; origin %s is gone)\n' "$_name" "$_b" "${_origin:-(unknown)}"
+    printf 'reclaim: %s (%s; origin %s is gone)\n' \
+      "$_name" "$(_bk_label "$_b" 2>/dev/null || printf '%s' "$_b")" "${_origin:-(unknown)}"
     if [[ "${_gc_yes:-0}" == "1" ]]; then
-      case "$_b" in
-        podman)
-          command -v podman >/dev/null 2>&1 && \
-            { _quiet podman rm -f "$_name" || \
-                printf 'bx: could not delete container %s\n' "$_name" >&2; } ;;
-        *)
-          command -v smolvm >/dev/null 2>&1 && \
-            { _quiet smolvm machine delete --name "$_name" -f || \
-                printf 'bx: could not delete machine %s\n' "$_name" >&2; } ;;
-      esac
+      if _bk_available "$_b"; then
+        _vm_name="$_name"; _backend="$_b"
+        _backend_delete
+      else
+        printf 'bx: %s is not on PATH; cannot delete %s\n' "$(_bk_program "$_b" 2>/dev/null || printf '%s' "$_b")" "$_name" >&2
+      fi
       rm -f "$_file"
       rm -rf "$(_resolve_state_dir)/${_name}.lock.d"
       printf 'deleted: %s\n' "$_name"
@@ -1068,6 +1469,7 @@ if [[ "${_gc:-}" == "1" ]]; then
   _gc_action
   exit 0
 fi
+
 
 if [[ -n "$_show" || -n "$_recipe" ]]; then
   _load_sources
@@ -1104,9 +1506,6 @@ if [[ -n "$BX_PROFILE" ]]; then
   exec "$BX_PROFILE" ${_own_flags[@]+"${_own_flags[@]}"} ${_passthrough[@]+"${_passthrough[@]}"}
 fi
 
-command -v smolvm >/dev/null 2>&1 || _smolvm_present=0
-_smolvm_present="${_smolvm_present:-1}"
-
 _image="${BX_IMAGE:-debian:bookworm-slim}"
 _vm_name="${BX_NAME:-bx}"
 _vm_cpus="${BX_CPUS:-4}"
@@ -1140,138 +1539,13 @@ mkdir -p "$_state_dir" 2>/dev/null || _die "could not create state dir $_state_d
 _state_file="${_state_dir}/${_vm_name}.state"
 _lock_dir="${_state_dir}/${_vm_name}.lock.d"
 
-# ── backend ─────────────────────────────────────────────────────────────────
-# bx's lifecycle verbs (create/start/stop/exec/delete) are the same shape
-# whether the machine is a microVM or a container; only the program performing
-# them differs. The backend is chosen explicitly by the recipe (`backend =
-# smolvm` or `backend = podman`), never inferred: a machine's mounts, secrets,
-# and reclamation differ between the two, and silently reusing one as the other
-# is exactly the reconciliation failure this tool exists to prevent.
-#
-# The one exception is the case this key was added for: bx running *inside* a
-# vm, where it cannot boot a vm of its own but the guest can run containers.
-# When the recipe says nothing and smolvm is absent while podman is present,
-# `podman` is selected and *said so* on stderr. It is a convenience, not a
-# guess: the plan (`--dry-run`) prints the backend either way, and a recipe
-# that means smolvm keeps meaning smolvm.
-_backend="${BX_BACKEND:-}"
-_backend_inferred=0
-if [[ -z "$_backend" ]]; then
-  if [[ "$_smolvm_present" == "1" ]]; then
-    _backend="smolvm"
-  elif command -v podman >/dev/null 2>&1; then
-    _backend="podman"
-    _backend_inferred=1
-  else
-    _backend="smolvm"
-  fi
-fi
-case "$_backend" in
-  smolvm|podman) ;;
-  *) _die "unknown backend '$_backend' (expected 'smolvm' or 'podman')" ;;
-esac
-# Say so, once, when the backend was inferred rather than declared. A recipe
-# that means a vm should be told it did not get one, and a user inside a vm
-# should be told why this run is a container.
-if [[ "$_backend_inferred" == "1" ]]; then
-  _run_note "smolvm is not on PATH; using backend 'podman' (containers nested in this environment). Set backend= to choose explicitly."
-fi
-_backend_program="$_backend"
-command -v "$_backend_program" >/dev/null 2>&1 || _backend_present=0
-_backend_present="${_backend_present:-1}"
 
-# Does a machine with this name already exist, according to the backend? smolvm
-# lists machine names; podman lists container names (running or stopped).
-_machine_exists() {
-  [[ "$_backend_present" == "1" ]] || return 1
-  case "$_backend" in
-    smolvm) smolvm machine ls -q 2>/dev/null | grep -qx "$_vm_name" ;;
-    podman) podman ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$_vm_name" ;;
-  esac
-}
 
-# ── backend verbs ───────────────────────────────────────────────────────────
-# One function per lifecycle step, dispatching on the backend. The call sites
-# below never name a runtime, so a new backend is added here and nowhere else.
-# The two backends differ in more than spelling, and the differences are
-# deliberate:
-#
-#   mounts   smolvm binds a host directory into the vm (`--volume H:G`);
-#            podman bind-mounts it (`-v H:G`). Same pair grammar.
-#   net      smolvm needs `--net` to enable it; a container is on the default
-#            bridge unless told `--network=none`.
-#   secrets  smolvm takes `--secret-env GUEST=HOST`; a container takes
-#            `-e GUEST`, inheriting the value from the exec's environment,
-#            which bx sets from the host variable by name. Either way the
-#            value never lands in argv — only the name does.
-#   image    smolvm pulls and unpacks a rootfs; podman pulls an image.
-_backend_create() { # none; reads _create_args-shaped inputs from caller
-  case "$_backend" in
-    smolvm) _quiet_or_die "could not create machine $_vm_name" \
-              smolvm machine create "${_create_args[@]}" ;;
-    podman) _quiet_or_die "could not create container $_vm_name" \
-              podman create "${_create_args[@]}" ;;
-  esac
-}
+# Past every inspection subcommand. A real run must have a runtime chosen, and
+# the choice is made here so that `--status`, `--gc`, `--show`, and `--new`
+# never prompt and never need a runtime installed.
+_choose_backend
 
-_backend_start() {
-  case "$_backend" in
-    smolvm) _quiet_or_die "machine '$_vm_name' failed to start. If its mounts or image changed
-since it was created, recreate it: bx --reset" \
-              smolvm machine start --name "$_vm_name" ;;
-    podman) _quiet_or_die "container '$_vm_name' failed to start. If its mounts or image changed
-since it was created, recreate it: bx --reset" \
-              podman start "$_vm_name" ;;
-  esac
-}
-
-_backend_stop() {
-  case "$_backend" in
-    smolvm) _quiet smolvm machine stop --name "$_vm_name" || true ;;
-    podman) _quiet podman stop "$_vm_name" || true ;;
-  esac
-}
-
-_backend_delete() {
-  case "$_backend" in
-    smolvm) _quiet smolvm machine delete --name "$_vm_name" -f || true ;;
-    podman) _quiet podman rm -f "$_vm_name" || true ;;
-  esac
-}
-
-# Exec is the one verb with a material difference in argument shape, because
-# the secret and env passing differs. The caller supplies the secret/env args
-# already rendered for the backend by `_backend_secret_args` and
-# `_backend_env_args`; here we only choose the program and the exec form.
-_backend_exec() { # tty(0|1) command
-  local _tty="$1" _cmd="$2"
-  case "$_backend" in
-    smolvm)
-      if [[ "$_tty" == "1" ]]; then
-        smolvm machine exec --name "$_vm_name" -i -t \
-          ${_secret_args[@]+"${_secret_args[@]}"} \
-          ${_passthrough_env_args[@]+"${_passthrough_env_args[@]}"} \
-          -- bash -lc "$_cmd"
-      else
-        smolvm machine exec --name "$_vm_name" \
-          ${_secret_args[@]+"${_secret_args[@]}"} \
-          ${_passthrough_env_args[@]+"${_passthrough_env_args[@]}"} \
-          -- bash -lc "$_cmd"
-      fi ;;
-    podman)
-      if [[ "$_tty" == "1" ]]; then
-        podman exec -i -t \
-          ${_secret_args[@]+"${_secret_args[@]}"} \
-          ${_passthrough_env_args[@]+"${_passthrough_env_args[@]}"} \
-          "$_vm_name" bash -lc "$_cmd"
-      else
-        podman exec -i \
-          ${_secret_args[@]+"${_secret_args[@]}"} \
-          ${_passthrough_env_args[@]+"${_passthrough_env_args[@]}"} \
-          "$_vm_name" bash -lc "$_cmd"
-      fi ;;
-  esac
-}
 
 # The recorded shape, or empty when this name has never been created here.
 _recorded_shape() {
@@ -1300,18 +1574,19 @@ _want_shape="${_want_shape%$'\n'}"
 # resolves HOST in the parent environment; podman has no equivalent, so bx
 # exports HOST and asks podman for `-e GUEST`, omitting the value from argv.
 # The invariant the test suite pins — the secret's value is never in argv —
-# holds for both backends; only the *name* appears.
+# holds for both backends; only the *name* appears. Each backend renders its
+# own arg and says whether the host variable must be exported; this loop never
+# branches on the runtime.
 _secret_args=()
 _secret_exports=()
 _secret_lifetimes_record=""
 while IFS= read -r _spec; do
   [[ -n "$_spec" ]] || continue
   _secret_split "$_spec"
-  case "$_backend" in
-    smolvm) _secret_args+=(--secret-env "${_secret_guest}=${_secret_host}") ;;
-    podman) _secret_args+=(-e "${_secret_guest}")
-            _secret_exports+=("${_secret_host}") ;;
-  esac
+  # The backend appends its own arg(s) to `_secret_args`, and reports whether
+  # the host variable must be exported so the value resolves at exec time.
+  "bk_${_backend}_secret_arg"
+  [[ "$(bk_"${_backend}"_secret_export)" == "1" ]] && _secret_exports+=("$_secret_host")
   _secret_lifetimes_record="${_secret_lifetimes_record}${_secret_guest}=${_secret_life}
 "
 done < <(_read_lines "${BX_SECRET_ENV:-}")
@@ -1366,47 +1641,11 @@ _shape_matches() {
 
 # ── plan, before doing anything ─────────────────────────────────────────────
 
-# Is the image already in the runtime's store, and does this machine already
-# carry the toolchain in its writable layer? bx cannot see inside the runtime's
-# storage in general, but the common smolvm layout is documented (see README),
-# and a probe that answers "cached / not cached" is far more useful than a
-# guess. When the layout is absent, the answer is `unknown`, never a silent
-# `no`, so the cost line stays honest.
-_image_cached() {
-  # podman can answer this directly, so ask it rather than guessing.
-  if [[ "$_backend" == "podman" ]]; then
-    if command -v podman >/dev/null 2>&1; then
-      if podman image exists "$1" 2>/dev/null; then printf 'cached'; else printf 'not cached'; fi
-    else
-      printf 'unknown'
-    fi
-    return 0
-  fi
-  local _root="${SMOLVM_STORAGE:-/storage}"
-  local _safe
-  _safe="$(printf '%s' "$1" | sed 's#[/:]#_#g')"
-  if [[ -d "$_root/manifests" ]]; then
-    [[ -f "$_root/manifests/${_safe}.json" ]] && { printf 'cached'; return 0; }
-    printf 'not cached'; return 0
-  fi
-  printf 'unknown'
-}
-
-_toolchain_present() {
-  # A container's writable layer is podman's, and bx does not read inside it;
-  # the smolvm overlay layout is the only one bx understands. Say so rather
-  # than lie about a layer bx cannot see.
-  [[ "$_backend" == "smolvm" ]] || { printf 'unknown'; return 0; }
-  local _root="${SMOLVM_STORAGE:-/storage}"
-  local _upper="$_root/overlays/persistent-${_vm_name}/upper"
-  if [[ -d "$_upper" ]]; then
-    if [[ -e "$_upper/root/.bun" || -e "$_upper/usr/local/bin/pi" ]]; then
-      printf 'present'; return 0
-    fi
-    printf 'absent'; return 0
-  fi
-  printf 'unknown'
-}
+# The image-cache and toolchain probes are backend knowledge and live in the
+# verbs above; the plan just asks the chosen backend. Kept as thin wrappers so
+# the cost model reads the same regardless of runtime.
+_image_cached() { _backend_image_cached "$1"; }
+_toolchain_present() { _backend_toolchain_present; }
 
 _exists=0
 _machine_exists && _exists=1
@@ -1451,7 +1690,7 @@ fi
 # A real run needs the runtime. `--dry-run` deliberately does not, so the plan
 # and cost model can be inspected on a host without the backend installed.
 [[ "$_backend_present" == "1" ]] || \
-  _die "backend '$_backend' is not on PATH (it is required for a real run; --dry-run and --status do not need it)"
+  _die "backend '$_backend' ($(_bk_label "$_backend") via '$(_bk_program "$_backend")') is not on PATH (it is required for a real run; --dry-run and --status do not need it)"
 if [[ "$_action" == "conflict" ]]; then
   if [[ -z "$(_recorded_shape)" ]]; then
     _die "machine '$_vm_name' already exists but has no recorded shape (it was
@@ -1494,26 +1733,7 @@ if [[ "$_action" == "recreate" && "$_exists" == "1" ]]; then
 fi
 
 if [[ "$_exists" == "0" ]]; then
-  case "$_backend" in
-    smolvm)
-      _create_args=(--name "$_vm_name" --image "$_image" --cpus "$_vm_cpus" --mem "$_vm_mem")
-      [[ "$_net" == "1" ]] && _create_args+=(--net)
-      while IFS= read -r _mount; do
-        [[ -n "$_mount" ]] || continue
-        _create_args+=(--volume "$_mount")
-      done < <(printf '%s\n' "$_want_mounts") ;;
-    podman)
-      # A container runs until its command exits; bx execs into it repeatedly,
-      # so it is created with a long-lived command and stopped by `podman
-      # stop`. `--entrypoint` empty plus `sleep infinity` gives exactly that.
-      _create_args=(--name "$_vm_name" --cpus "$_vm_cpus" --memory "${_vm_mem}m")
-      [[ "$_net" == "0" ]] && _create_args+=(--network=none)
-      while IFS= read -r _mount; do
-        [[ -n "$_mount" ]] || continue
-        _create_args+=(-v "$_mount")
-      done < <(printf '%s\n' "$_want_mounts")
-      _create_args+=(--entrypoint '' "$_image" sleep infinity) ;;
-  esac
+  _backend_create_args
   # A first run is the only slow, chatty one: image pull, rootfs unpack. Say so
   # plainly, and surface the runtime's own output if it fails.
   _run_say "creating $_vm_name from $_image (first run; this may take a minute)"
@@ -1554,10 +1774,7 @@ fi
 _bootstrap_env_args=()
 while IFS= read -r _pair; do
   [[ -n "$_pair" ]] || continue
-  case "$_backend" in
-    smolvm) _bootstrap_env_args+=(--env "$_pair") ;;
-    podman) _bootstrap_env_args+=(-e "$_pair") ;;
-  esac
+  _backend_env_arg "$_pair"
 done < <(_read_lines "${BX_BOOTSTRAP_ENV:-}")
 
 # Forward the curated host environment (terminal type, locale, colour) so a
@@ -1569,16 +1786,14 @@ _passthrough_env_args=()
 for _name in $_bx_env_passthrough; do
   _val="${!_name:-}"
   [[ -n "$_val" ]] || continue
-  case "$_backend" in
-    smolvm) _passthrough_env_args+=(--env "${_name}=${_val}") ;;
-    podman) _passthrough_env_args+=(-e "${_name}=${_val}") ;;
-  esac
+  _backend_passthrough_arg "${_name}=${_val}"
 done
 
 # For podman, a secret crosses as `-e GUEST` and inherits its value from the
 # exec's environment, so the host variable must be exported here. For smolvm,
 # `--secret-env GUEST=HOST` does the resolution itself and nothing is exported.
-if [[ "$_backend" == "podman" && ${#_secret_exports[@]} -gt 0 ]]; then
+# The backend reports which; this block does not know the runtime's name.
+if [[ "$(_backend_secret_export)" == "1" && ${#_secret_exports[@]} -gt 0 ]]; then
   for _host_name in "${_secret_exports[@]}"; do
     # `export "$name"` exports the variable *named by* the value, which is
     # what we want here. shellcheck reads the quotes as an indirect-export
@@ -1595,18 +1810,7 @@ if [[ -n "${BX_BOOTSTRAP:-}" ]]; then
   # avoid. `-v` always shows it.
   _trace "bootstrap"
   set +e
-  case "$_backend" in
-    smolvm)
-      smolvm machine exec --name "$_vm_name" \
-        ${_secret_args[@]+"${_secret_args[@]}"} \
-        ${_bootstrap_env_args[@]+"${_bootstrap_env_args[@]}"} \
-        -- bash -c "$BX_BOOTSTRAP" ;;
-    podman)
-      podman exec -i \
-        ${_secret_args[@]+"${_secret_args[@]}"} \
-        ${_bootstrap_env_args[@]+"${_bootstrap_env_args[@]}"} \
-        "$_vm_name" bash -c "$BX_BOOTSTRAP" ;;
-  esac
+  _backend_exec_bootstrap
   _bootstrap_status=$?
   set -e
   [[ "$_bootstrap_status" == 0 ]] || exit "$_bootstrap_status"

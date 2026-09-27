@@ -124,7 +124,8 @@ Every `bx` setting is a recipe key:
 | `secret_env` | `GUEST=HOSTVAR[:LIFETIME]`, passed by name (repeatable) |
 | `pre_command` | host shell run after start, before the bootstrap |
 | `state_dir` | where the lock and recorded shape live |
-| `backend` | the runtime that owns the machine: `smolvm` (a microVM, the default) or `podman` (a container). Use `podman` from inside a machine, where a vm cannot boot. Part of the shape: changing it forces `--reset`. If omitted, `smolvm` is used when it is on `PATH`, otherwise `podman` if present, and bx says which it chose. |
+| `backend` | the runtime that owns the machine: `smolvm` (a microVM) or `podman` (a container). Use `podman` from inside a machine, where a vm cannot boot. Part of the shape: changing it forces `--reset`. If omitted, bx decides how to proceed: exactly one runtime installed means it is used; two or more (or `backend_prompt`) means bx asks, and a non-interactive run is an error naming both choices. `--dry-run` never prompts. |
+| `backend_prompt` | `1` to ask for the backend even when only one is installed |
 | `extends` | inherit from another recipe (see **Composition**) |
 | `resolve` | run a resolver before merging this recipe (see **Resolvers**) |
 
