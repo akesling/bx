@@ -418,6 +418,43 @@ test_backend_contract_is_asserted_on_every_backend() {
   _pass
 }
 
+# A shipped regression: a failing `pre_command` aborted bx with its raw status
+# and printed nothing, so `bx pi` failed as a silent `exit 1`. The rule is that
+# bx's own setup steps name themselves; only the guest command's status passes
+# through verbatim. Pin the source shape, since the behavior is covered in
+# bx_test.sh and this keeps a future edit from removing the guard.
+test_setup_failures_are_never_silent() {
+  _current="a failed setup step is reported, and the exit contract is stated"
+  local _bx="${_repo_root}/bin/bx" _readme="${_repo_root}/README.md"
+  if ! grep -qF 'pre_command failed' "$_bx"; then
+    _fail "bx no longer reports a failed pre_command"
+    return
+  fi
+  if ! grep -qF 'bootstrap failed' "$_bx"; then
+    _fail "bx no longer reports a failed bootstrap"
+    return
+  fi
+  # The invocation must sit inside a `set +e` / status-check guard, not run
+  # bare where `set -e` would abort on it silently. Check the region around the
+  # call for the guard rather than the line itself, which is legitimately just
+  # `bash -c "$BX_PRE_COMMAND"`.
+  local _region
+  _region="$(sed -n '/if \[\[ -n "${BX_PRE_COMMAND:-}" \]\]/,/^fi$/p' "$_bx")"
+  if ! grep -q 'set +e' <<<"$_region"; then
+    _fail "pre_command no longer runs under set +e; a failure would exit silently"
+    return
+  fi
+  if ! grep -q '_pre_status' <<<"$_region"; then
+    _fail "pre_command's status is no longer captured and checked"
+    return
+  fi
+  if ! grep -qF "otherwise bx names the step that failed" "$_readme"; then
+    _fail "README no longer states the exit-status contract for setup failures"
+    return
+  fi
+  _pass
+}
+
 # ── real: isolation, on whichever backend can actually run ──────────────────
 # The fence is bx's reason to exist, so it must be asserted on every backend
 # that can boot, not only the vm. These take the backend as an argument: the
@@ -541,6 +578,7 @@ test_backend_choice_is_documented
 test_net_mode_choice_is_documented
 test_runtime_args_are_never_inferred
 test_backend_contract_is_asserted_on_every_backend
+test_setup_failures_are_never_silent
 
 if [[ "${BX_REAL:-0}" == "1" ]]; then
   # Run the fence on every backend that can actually boot here, not just the

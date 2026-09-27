@@ -1971,9 +1971,24 @@ trap '_cleanup; exit $?' EXIT
 # A caller may need to move files into the guest before the bootstrap runs
 # (for example `smolvm machine cp`), which only makes sense once the machine
 # is up. It is host-side shell, so it is evaluated here, not in the guest.
+#
+# `pre_command` is how a resolver hands a file to the guest, and a resolver
+# commonly redirects to keep the console clean. That makes a failure invisible:
+# under `set -e` a non-zero status here would abort bx with the command's exit
+# code and print nothing at all, so the run would look like a silent `exit 1`.
+# Run it with `set +e`, report what failed, and only then propagate the status.
 if [[ -n "${BX_PRE_COMMAND:-}" ]]; then
   _trace "pre_command"
+  set +e
   bash -c "$BX_PRE_COMMAND"
+  _pre_status=$?
+  set -e
+  if [[ "$_pre_status" != 0 ]]; then
+    _die "pre_command failed with status ${_pre_status}. The command was:
+  ${BX_PRE_COMMAND}
+It runs on the host after the machine starts and before the bootstrap. If its
+output was redirected, run with BX_VERBOSE=2 to see the underlying command."
+  fi
 fi
 
 _bootstrap_env_args=()
@@ -2018,7 +2033,13 @@ if [[ -n "${BX_BOOTSTRAP:-}" ]]; then
   _backend_exec_bootstrap
   _bootstrap_status=$?
   set -e
-  [[ "$_bootstrap_status" == 0 ]] || exit "$_bootstrap_status"
+  # A bootstrap failure must say so. The runtime's own output has already gone
+  # to the console (bx does not suppress it), but when a bootstrap is quiet on
+  # the way to failing, the status alone is not a diagnosable error — name the
+  # step so the exit code is never the whole story.
+  if [[ "$_bootstrap_status" != 0 ]]; then
+    _die "bootstrap failed with status ${_bootstrap_status}. The bootstrap runs in the guest before the command; see the output above, or run with BX_VERBOSE=2."
+  fi
 fi
 
 if [[ -n "$_workdir" ]]; then

@@ -536,6 +536,75 @@ test_empty_input_does_not_abort() {
   rm -rf "$d"
 }
 
+# ── a failing step must name itself ─────────────────────────────────────────
+# A regression that shipped: a `pre_command` that fails under `set -e` aborted
+# bx with its raw status and printed nothing, so `bx pi` looked like a silent
+# `exit 1`. The resolver's own pre_command redirected to /dev/null, which hid
+# even the runtime's message. These pin that a failed step is reported, that
+# its status is preserved, and that the normal path is untouched.
+test_failing_pre_command_is_reported() {
+  _current="a failing pre_command is reported, not a silent exit"
+  local d out rc
+  d="$(_new_workdir)"
+  out="$(cd "$d" && BX_NAME=mpre BX_COMMAND="true" \
+    BX_PRE_COMMAND="exit 3" \
+    BX_STATE_DIR="$d/local" PATH="${_fake_bin_dir}:$PATH" \
+    "$_bx" 2>&1)"
+  rc=$?
+  assert_eq "1" "$rc" "bx exits 1 (its own error), not the raw command status"
+  assert_contains "pre_command failed" "$out" "the failing step is named"
+  assert_contains "exit 3" "$out" "the failing command is shown"
+  rm -rf "$d"
+}
+
+# The same failure with output redirected — which is how the pi resolver writes
+# it — must still be reported by bx, because bx, not the command, is speaking.
+test_redirected_pre_command_failure_is_still_reported() {
+  _current="a pre_command that redirects its output is still reported"
+  local d out rc
+  d="$(_new_workdir)"
+  out="$(cd "$d" && BX_NAME=mpre2 BX_COMMAND="true" \
+    BX_PRE_COMMAND="false >/dev/null 2>&1" \
+    BX_STATE_DIR="$d/local" PATH="${_fake_bin_dir}:$PATH" \
+    "$_bx" 2>&1)"
+  rc=$?
+  assert_eq "1" "$rc" "exit status is bx's error, not a silent leak"
+  assert_contains "pre_command failed" "$out" "the redirect cannot hide the failure"
+  rm -rf "$d"
+}
+
+test_failing_bootstrap_is_reported() {
+  _current="a failing bootstrap is reported, not a silent exit"
+  local d out rc
+  d="$(_new_workdir)"
+  # FAKE_EXEC_RC drives the fake's `machine exec`, which is the bootstrap.
+  out="$(cd "$d" && BX_NAME=mboot BX_COMMAND="true" \
+    BX_BOOTSTRAP="echo hi" BX_STATE_DIR="$d/local" \
+    FAKE_EXEC_RC=5 PATH="${_fake_bin_dir}:$PATH" \
+    "$_bx" 2>&1)"
+  rc=$?
+  assert_eq "1" "$rc" "bx reports its own failure rather than leaking 5"
+  assert_contains "bootstrap failed" "$out" "the failing step is named"
+  assert_contains "status 5" "$out" "the underlying status is shown"
+  rm -rf "$d"
+}
+
+# The normal path must stay faithful: a pre_command that succeeds is silent,
+# and the guest's status still passes through untouched.
+test_successful_pre_command_is_silent_and_status_passes_through() {
+  _current="a succeeding pre_command is silent and the guest status survives"
+  local d out rc
+  d="$(_new_workdir)"
+  out="$(cd "$d" && BX_NAME=mpre3 BX_COMMAND="false" \
+    BX_PRE_COMMAND="true" BX_STATE_DIR="$d/local" \
+    FAKE_EXEC_RC=9 PATH="${_fake_bin_dir}:$PATH" \
+    "$_bx" 2>&1)"
+  rc=$?
+  assert_eq "9" "$rc" "the guest status is still propagated verbatim"
+  assert_not_contains "pre_command" "$out" "a successful pre_command says nothing"
+  rm -rf "$d"
+}
+
 test_cpu_change_conflicts() {
   _current="changing cpus conflicts"
   local d out
@@ -1504,6 +1573,10 @@ test_signal_reaches_foreground_job
 test_bootstrap_comment_does_not_end_value
 test_guest_exit_status_propagates
 test_empty_input_does_not_abort
+test_failing_pre_command_is_reported
+test_redirected_pre_command_failure_is_still_reported
+test_failing_bootstrap_is_reported
+test_successful_pre_command_is_silent_and_status_passes_through
 test_cpu_change_conflicts
 test_unknown_option_is_rejected
 test_invalid_machine_name_is_rejected

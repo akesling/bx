@@ -136,9 +136,12 @@ printf 'secret_env=PI_CONTEXT_WINDOW=BX_PI_SECRET_CONTEXT_WINDOW:persisted\n'
 printf 'secret_env=PI_MAX_TOKENS=BX_PI_SECRET_MAX_TOKENS:persisted\n'
 
 # The extension, if present, is copied into the guest before the bootstrap.
+# Only stdout is discarded: stderr is kept so a failed copy is diagnosable
+# rather than a silent exit. (bx names the failing step; this keeps the
+# runtime's own reason.)
 if [[ -n "$_extension" ]]; then
   printf 'bootstrap_env=EXTENSION_PATH=/tmp/subconscious-compaction.ts\n'
-  printf 'pre_command=smolvm machine cp %s pi-%s:/tmp/subconscious-compaction.ts --mode 644 >/dev/null 2>&1\n' \
+  printf 'pre_command=smolvm machine cp %s pi-%s:/tmp/subconscious-compaction.ts --mode 644 >/dev/null\n' \
     "$(printf '%q' "$_extension")" "$_dir_slug"
 fi
 

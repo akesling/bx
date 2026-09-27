@@ -575,7 +575,12 @@ controls — and deliberately different in the ways isolation requires. The
 fidelity guarantees:
 
 - **Exit status is the guest command's.** bx exits with exactly the status the
-guest returned; it does not flatten it.
+guest returned; it does not flatten it. That applies to the command. A failure
+in bx's *own* setup — a `pre_command` or `bootstrap` that returns non-zero — is
+reported and exits `1`, because the guest command never ran, so its status
+would be a fiction. The rule is: the exit status is the guest's when there was
+a guest; otherwise bx names the step that failed, so a non-zero exit is never
+silent.
 - **Signals reach the guest.** `bx` runs the exec in the foreground, so a
   terminal's `Ctrl-C`, `TERM`, and resize (`WINCH`) go to the whole foreground
   job — `smolvm` and, through it, the guest — exactly as they would to `pi` run
