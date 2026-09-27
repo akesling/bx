@@ -760,6 +760,17 @@ test_recipe_list() {
   rm -rf "$_rhome" "$_rproj"
 }
 
+test_version_reports_the_build() {
+  _current="--version identifies the build, so a shell's bx maps to a checkout"
+  local out
+  _recipe_env
+  out="$(_run_recipe_bx --version)"
+  assert_contains "bx " "$out" "prints a bx version line"
+  assert_contains "recipes:" "$out" "names the recipe book in use"
+  assert_contains "machines:" "$out" "names the machine book in use"
+  rm -rf "$_rhome" "$_rproj"
+}
+
 test_recipe_list_shows_description() {
   _current="--list shows the comment above a recipe as its description"
   local out
@@ -889,6 +900,55 @@ test_recipe_resolver_missing_is_reported() {
   printf '[x]\nresolve = no-such-resolver\ncommand = true\n' >"$_rproj/.bx.conf"
   out="$(_run_recipe_bx --show x)"
   assert_contains "resolve 'no-such-resolver' not found" "$out" "names the missing resolver"
+  rm -rf "$_rhome" "$_rproj"
+}
+
+# A regression that shipped: the resolver's status was read from a process
+# substitution (`done < <(...)`), which always reports 0, so a resolver that
+# failed was ignored and bx carried on with a half-resolved recipe — no name,
+# no secrets, no model — and exited 0. For `pi` that is an agent launched with
+# nothing it needs. A failing resolver must stop the run.
+test_recipe_resolver_failure_stops_the_run() {
+  _current="a failing resolver stops the run instead of being ignored"
+  local out rc
+  _recipe_env
+  cat >"${_rproj}/bad.resolve" <<'EOF'
+#!/usr/bin/env bash
+printf 'bad.resolve: cannot resolve\n' >&2
+exit 1
+EOF
+  chmod +x "${_rproj}/bad.resolve"
+  cat >"$_rproj/.bx.conf" <<'EOF'
+[r]
+resolve = bad.resolve
+image = alpine
+mounts = /a:/a
+command = echo hi
+EOF
+  out="$(BX_RECIPES_DIR="$_rproj" _run_recipe_bx --dry-run r 2>&1)"
+  rc=$?
+  assert_eq "1" "$rc" "a failed resolver is a non-zero exit"
+  assert_contains "resolver 'bad.resolve' failed" "$out" "names the resolver"
+  assert_not_contains "action=create" "$out" "no plan is printed for a half-resolved recipe"
+  rm -rf "$_rhome" "$_rproj"
+}
+
+# The values a resolver supplies must not be partially applied when it fails.
+test_recipe_resolver_failure_does_not_emit_partial_plan() {
+  _current="a resolver that fails after emitting lines still stops the run"
+  local out rc
+  _recipe_env
+  cat >"${_rproj}/half.resolve" <<'EOF'
+#!/usr/bin/env bash
+printf 'name=half-resolved\n'
+exit 2
+EOF
+  chmod +x "${_rproj}/half.resolve"
+  printf '[h]\nresolve = half.resolve\nimage = alpine\nmounts = /a:/a\ncommand = true\n' >"$_rproj/.bx.conf"
+  out="$(BX_RECIPES_DIR="$_rproj" _run_recipe_bx --dry-run h 2>&1)"
+  rc=$?
+  assert_eq "1" "$rc" "partial output does not rescue a failed resolver"
+  assert_contains "status 2" "$out" "the resolver's status is reported"
   rm -rf "$_rhome" "$_rproj"
 }
 
@@ -1586,6 +1646,7 @@ test_recipe_variable_expansion
 test_recipe_unknown_key_is_rejected
 test_recipe_unknown_name_is_rejected
 test_recipe_list
+test_version_reports_the_build
 test_recipe_list_shows_description
 test_recipe_list_marks_machines
 test_recipe_typo_suggests_the_close_name
@@ -1595,6 +1656,8 @@ test_recipe_extends_inherits_scalars_and_lists
 test_recipe_resolver_emits_values
 test_recipe_resolver_secrets_stay_out_of_show
 test_recipe_resolver_missing_is_reported
+test_recipe_resolver_failure_stops_the_run
+test_recipe_resolver_failure_does_not_emit_partial_plan
 test_recipe_new_scaffolds
 test_recipe_profile_hands_off
 test_recipe_machine_is_a_separate_dir

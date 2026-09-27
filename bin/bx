@@ -12,6 +12,7 @@
 #   bx --status             # list machines: name, dir, image, running, size
 #   bx --gc [--yes]         # reclaim machines whose origin dir is gone (preview first)
 #   bx --new <recipe>       # scaffold a recipe in ~/.bx/recipes
+#   bx --version            # print the build, so `bx` in a shell can be matched to a checkout
 #   bx --machine <name> <recipe>  # run a recipe on the named machine
 #   bx --help
 #
@@ -609,6 +610,33 @@ _usage() {
   sed -n '2,70p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
+# Report the build, so a `bx` on PATH can be matched to a checkout or an install.
+# There is no version number to drift: the commit is the identity. Resolved from
+# the checkout that holds this script when it is one, else from the installed
+# manifest, else `unknown` — never guessed.
+_show_version() {
+  local _self _dir _commit _describe _installed
+  _self="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo .)"
+  _commit=""
+  _describe=""
+  # A checkout: this script sits in <root>/bin.
+  if git -C "${_self}/.." rev-parse --short HEAD >/dev/null 2>&1; then
+    _commit="$(git -C "${_self}/.." rev-parse --short HEAD 2>/dev/null)"
+    _describe="$(git -C "${_self}/.." describe --tags --always --dirty 2>/dev/null)"
+  fi
+  # An install: the commit recorded by install.sh, beside the recipe book.
+  if [[ -z "$_describe" ]]; then
+    for _installed in "${_self}/../share/bx/build" "$_self/../build"; do
+      [[ -f "$_installed" ]] && { _describe="$(head -1 "$_installed")"; break; }
+    done
+  fi
+  printf 'bx %s\n' "${_describe:-${_commit:-unknown}}"
+  printf 'script: %s\n' "$_self/$(basename "${BASH_SOURCE[0]}")"
+  [[ -n "$_commit" ]] && printf 'commit: %s\n' "$_commit"
+  printf 'recipes: %s\n' "${BX_RECIPES_DIR:-$(_recipes_dir)}"
+  printf 'machines: %s\n' "${BX_MACHINES_DIR:-$(_machines_dir)}"
+}
+
 # ── recipes ─────────────────────────────────────────────────────────────────
 # A recipe is a `[name]` section of `key = value` lines. This is deliberately
 # not TOML: the loader must work with nothing but bash, so the grammar is the
@@ -1104,6 +1132,24 @@ _run_resolver() {
          elif command -v "$_resolve" >/dev/null 2>&1; then _exe="$(command -v "$_resolve")"; fi ;;
   esac
   [[ -n "$_exe" ]] || _die "[${_name}] resolve '${_resolve}' not found (looked in the book and PATH)"
+  # Capture the resolver's exit status. It cannot come from a process
+  # substitution (`done < <(...)` always reports 0), so the output is written to
+  # a temp file and the resolver is run as a normal command whose status is
+  # checked. A resolver that fails must stop the run: continuing would resolve
+  # the recipe *without* the values it exists to supply — for `pi`, no name, no
+  # secrets, no model — and run something the user did not ask for.
+  local _out _resolver_status
+  _out="$(mktemp)" || _die "could not create a temp file for the resolver output"
+  set +e
+  BX_RECIPE="$_name" BX_RECIPE_DIR="$_book" "$_exe" >"$_out"
+  _resolver_status=$?
+  set -e
+  if [[ "$_resolver_status" != 0 ]]; then
+    rm -f "$_out"
+    _die "[${_name}] resolver '${_resolve}' failed with status ${_resolver_status}.
+A resolver supplies the values this recipe needs (name, secrets, model). Fix it
+or remove 'resolve = ${_resolve}', then run again."
+  fi
   while IFS= read -r _line || [[ -n "$_line" ]]; do
     [[ -n "$_line" ]] || continue
     case "$_line" in
@@ -1115,10 +1161,10 @@ _run_resolver() {
         export "${_key}=${_val}" ;;
       '@'*) continue ;;
       *=*) _merge_recipe_line "$_name" "$_line" "resolver:${_resolve}" ;;
-      *) _die "[${_name}] resolver ${_resolve}: unexpected output: ${_line}" ;;
+      *) rm -f "$_out"; _die "[${_name}] resolver ${_resolve}: unexpected output: ${_line}" ;;
     esac
-  done < <(BX_RECIPE="$_name" BX_RECIPE_DIR="$_book" "$_exe") || \
-    _die "[${_name}] resolver ${_resolve} failed"
+  done <"$_out"
+  rm -f "$_out"
   return 0
 }
 
@@ -1367,6 +1413,7 @@ while [[ $# -gt 0 ]]; do
     --machine) [[ $# -ge 2 ]] || _die "--machine needs a value"; BX_MACHINE="$2"; shift 2 ;;
     --machine=*) BX_MACHINE="${1#*=}"; shift ;;
     --list)    _load_sources; _recipe_list; exit 0 ;;
+    --version) _show_version; exit 0 ;;
     --status)  _show_status=1; shift ;;
     --gc)      _gc=1; shift ;;
     --yes|-y)  _gc_yes=1; shift ;;

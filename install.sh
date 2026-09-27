@@ -42,7 +42,13 @@ _machinedir="${DESTDIR}${PREFIX}/share/bx/machines"
 _manifest="${DESTDIR}${PREFIX}/share/bx/installed-files"
 _files=(bx)
 _book_files=(README.md bash.conf pi.conf pi.resolve sandbox.conf)
-_machine_files=(default.conf pi_agent.conf)
+# Every machine recipe in the checkout, discovered rather than listed, so a new
+# one cannot be forgotten here (nested_podman.conf was).
+_machine_files=()
+for _m in "${_src_dir}"/machines/*.conf; do
+  [[ -f "$_m" ]] || continue
+  _machine_files+=("$(basename "$_m")")
+done
 
 _do_uninstall() {
   local removed=0 f
@@ -109,9 +115,21 @@ for f in "${_machine_files[@]}"; do
   printf '%s\n' "${_machinedir}/${f}" >>"$_manifest"
 done
 
+# Record the build so an installed bx can be matched to a checkout. `bx
+# --version` reads this when there is no git metadata beside the script. Best
+# effort: a tarball install has no commit, and `unknown` is the honest answer.
+_build_info="${DESTDIR}${PREFIX}/share/bx/build"
+if git -C "$_src_dir" rev-parse --short HEAD >/dev/null 2>&1; then
+  printf '%s\n' "$(git -C "$_src_dir" describe --tags --always --dirty 2>/dev/null)" >"$_build_info"
+else
+  printf 'unknown\n' >"$_build_info"
+fi
+printf '%s\n' "$_build_info" >>"$_manifest"
+
 _note "installed ${_files[*]} into ${_bindir}"
 _note "installed recipe book into ${_bookdir}"
 _note "installed machine book into ${_machinedir}"
+_note "build: $(cat "$_build_info")"
 
 # Tell the user whether the destination is actually on PATH, rather than
 # assuming it is.
