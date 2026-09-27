@@ -1895,6 +1895,19 @@ _shape_matches() {
   if [[ "$_rec_core" != *$'\n'backend=* ]]; then
     _want_core="$(printf '%s\n' "$_want_core" | grep -v '^backend=')"
   fi
+  # `net` was a boolean before it was a mode: `1` meant "networking on" and is
+  # what `bridge` means now, `0` is `none`. A record written then must not read
+  # as a shape change, or every machine created before the vocabulary changed
+  # demands `--reset` for a difference that does not exist. Normalize the
+  # recorded spelling to the current one before comparing, rather than
+  # rewriting the state file: the recorded shape is evidence of what was
+  # created, and bx does not edit it in place outside a recreate.
+  local _rec_net
+  _rec_net="$(printf '%s\n' "$_rec_core" | sed -n 's/^net=//p' | head -n1)"
+  case "$_rec_net" in
+    1) _rec_core="$(printf '%s\n' "$_rec_core" | sed 's/^net=1$/net=bridge/')" ;;
+    0) _rec_core="$(printf '%s\n' "$_rec_core" | sed 's/^net=0$/net=none/')" ;;
+  esac
   [[ "$_rec_core" == "$_want_core" ]]
 }
 

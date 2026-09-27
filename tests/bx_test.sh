@@ -1362,6 +1362,60 @@ STATE
   rm -rf "$d"
 }
 
+# `net` was a boolean (`1`/`0`) before it was a mode (`bridge`/`none`). A
+# machine created then recorded `net=1`, and comparing that verbatim against a
+# recipe's normalized `net=bridge` made every such machine demand `--reset` on
+# the next run for a difference that does not exist. A record must be compared
+# in its own vocabulary, not rewritten, so the state file still says what was
+# actually created.
+test_legacy_boolean_net_record_still_reuses() {
+  _current="a record with net=1 reuses against a net=bridge recipe"
+  local d out
+  d="$(_new_workdir)"
+  cat >"$d/local/upnet.state" <<STATE
+image=debian:bookworm-slim
+cpus=4
+mem=4096
+net=1
+mounts:
+/only:/only
+STATE
+  out="$(cd "$d" && BX_NAME=upnet BX_MOUNTS="/only:/only" BX_NET=bridge \
+    BX_COMMAND="true" BX_STATE_DIR="$d/local" FAKE_VMS="upnet" \
+    PATH="${_fake_bin_dir}:$PATH" "$_bx" 2>&1)"
+  assert_not_contains "different shape" "$out" "net=1 is the same machine as net=bridge"
+  assert_not_contains "creating" "$out" "reuses rather than recreating"
+  # The recorded shape is evidence, not a cache to normalize in place.
+  if ! grep -q '^net=1$' "$d/local/upnet.state"; then
+    _fail "the recorded shape was rewritten instead of compared in its own vocabulary"
+  else
+    _ok
+  fi
+  rm -rf "$d"
+}
+
+# The normalization must not blunt the real check: a genuine move to a
+# different network is still a shape change and still needs --reset.
+test_legacy_net_record_still_detects_a_real_change() {
+  _current="a record with net=1 still conflicts when the recipe changes the mode"
+  local d out
+  d="$(_new_workdir)"
+  cat >"$d/local/upnet2.state" <<STATE
+image=debian:bookworm-slim
+cpus=4
+mem=4096
+net=1
+mounts:
+/only:/only
+STATE
+  out="$(cd "$d" && BX_NAME=upnet2 BX_MOUNTS="/only:/only" BX_NET=none \
+    BX_COMMAND="true" BX_STATE_DIR="$d/local" FAKE_VMS="upnet2" \
+    PATH="${_fake_bin_dir}:$PATH" "$_bx" 2>&1)"
+  assert_contains "different shape" "$out" "net=1 to net=none is a real change"
+  assert_contains "--reset" "$out" "names the fix"
+  rm -rf "$d"
+}
+
 # ── the container backend ───────────────────────────────────────────────────
 # bx inside a machine cannot boot a machine, but it can run a container. These
 # pin that the same lifecycle verbs reach podman, that the shape records which
@@ -1775,6 +1829,8 @@ test_status_marks_orphan
 test_gc_previews_then_deletes
 test_gc_keeps_live_machine
 test_old_state_file_still_reuses
+test_legacy_boolean_net_record_still_reuses
+test_legacy_net_record_still_detects_a_real_change
 test_container_backend_creates_and_execs
 test_backend_is_part_of_the_shape
 test_backend_asks_when_both_are_installed
