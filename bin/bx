@@ -178,6 +178,9 @@ _quiet_or_die() {
 #   `bk_<name>_passthrough_arg`  append one forwarded `--env` pair to `_passthrough_env_args`
 #   `bk_<name>_secret_arg` append one secret to `_secret_args` (name, not value)
 #   `bk_<name>_secret_export`   print 1 if the value must be exported by bx
+#   `bk_<name>_net_is_bridged`  print 0/1: is `bridge` a userspace NAT this
+#                               host's guest cannot route through? (the vm has
+#                               its own net; a container's bridge is NAT'd)
 #   `bk_<name>_size`       a human size for one machine, or `?`
 #   `bk_<name>_image_cached`      is the image already in its store?
 #   `bk_<name>_toolchain_present` is the baked toolchain in its writable layer?
@@ -207,6 +210,14 @@ _bk_label() { # name -> the noun a person reads
 }
 _bk_known() { _bk_program "$1" >/dev/null 2>&1; }
 _bk_available() { _bk_known "$1" && command -v "$(_bk_program "$1")" >/dev/null 2>&1; }
+
+# A machine with no recorded backend predates the `backend` key. smolvm was the
+# only runtime bx shipped before it, so that is what such a record means — not a
+# preference for the vm today. Kept here, beside the table, so the one place
+# that names a backend for a legacy record is inside the engine rather than in
+# `--status` and `--gc`, where adding a third backend would have to remember it.
+_bk_legacy_backend() { printf '%s' "${_BACKEND_NAMES[0]:-smolvm}"; }
+
 # Dispatch one verb to the chosen backend: every verb is a function named
 # `bk_<backend>_<verb>`, so the wrapper is uniform and no call site branches on
 # the runtime's name.
@@ -214,6 +225,8 @@ _bk() { # verb [args...]
   local _verb="$1"; shift
   "bk_${_backend}_${_verb}" "$@"
 }
+# The first declared backend is the original one; `_bk_legacy_backend` leans on
+# that ordering, so declare smolvm first.
 _bk_declare smolvm smolvm "microVM"
 _bk_declare podman podman "container"
 
@@ -416,6 +429,9 @@ bk_smolvm_size() { # machine name -> bytes-ish human string, or ?
 # whether the host variable must be exported.
 bk_smolvm_secret_arg() { _secret_args+=(--secret-env "${_secret_guest}=${_secret_host}"); }
 bk_smolvm_secret_export() { printf '0'; }
+# A vm has its own network stack; `bridge` is not a userspace NAT a guest has
+# to route through, so nothing here is affected by TSI.
+bk_smolvm_net_is_bridged() { printf '0'; }
 
 # Build the create argv for a machine. Reads `_vm_name`, `_image`, `_vm_cpus`,
 # `_vm_mem`, `_net`, `_want_mounts`, `_want_runtime_args`; writes `_create_args`.
@@ -523,6 +539,10 @@ bk_podman_size() { # container name -> writable size, or ?
 # on the guest name, so only the name reaches argv.
 bk_podman_secret_arg() { _secret_args+=(-e "${_secret_guest}"); }
 bk_podman_secret_export() { printf '1'; }
+# A container on podman's default `bridge` sits behind a userspace NAT. Inside a
+# TSI guest that NAT cannot route, so `bridge` is the mode this capability is
+# about.
+bk_podman_net_is_bridged() { printf '1'; }
 
 # Build the create argv. A container runs until its command exits; bx execs
 # into it repeatedly, so it is created with a long-lived command and stopped by
@@ -1434,9 +1454,10 @@ _status_action() {
     [[ -n "$_origin" && -d "$_origin" ]] && _dir_ok="present"
     # The backend is recorded in the state file, so a machine created as a vm
     # is queried as a vm even on a host where a container is the default. A
-    # machine from before `backend` existed is a smolvm one.
+    # machine with no recorded backend predates the key; the engine says what
+    # that omission means.
     _b="$(_state_field "$_file" backend)"
-    [[ -n "$_b" ]] || _b="smolvm"
+    [[ -n "$_b" ]] || _b="$(_bk_legacy_backend)"
     # Answer from the machine's own backend, by pointing the engine at it.
     _vm_name="$_name"
     _running="stopped"
@@ -1486,7 +1507,7 @@ _gc_action() {
       continue
     fi
     _b="$(_state_field "$_file" backend)"
-    [[ -n "$_b" ]] || _b="smolvm"
+    [[ -n "$_b" ]] || _b="$(_bk_legacy_backend)"
     _reclaim=$((_reclaim + 1))
     printf 'reclaim: %s (%s; origin %s is gone)\n' \
       "$_name" "$(_bk_label "$_b" 2>/dev/null || printf '%s' "$_b")" "${_origin:-(unknown)}"
@@ -1662,8 +1683,9 @@ _guest_is_tsi() {
 # goes through here too: a plan that cannot run is not a plan, and finding out
 # at create time instead of exec time is the difference this guard buys.
 _net_guard() {
-  # Only a container on the runtime bridge is affected; a vm has its own net.
-  [[ "$_backend" == "podman" && "$_net" == "bridge" ]] || return 0
+  # Only a backend whose `bridge` is a userspace NAT is affected; a vm has its
+  # own net. Asking the backend keeps this guard free of runtime names.
+  [[ "$(_bk net_is_bridged)" == "1" && "$_net" == "bridge" ]] || return 0
   _guest_is_tsi || return 0
 
   if [[ "$_net_approved" == "1" ]]; then

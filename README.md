@@ -641,13 +641,21 @@ Keep that path in `.gitignore`.
 sh scripts/check.sh      # shellcheck + the test suite
 ```
 
-The suite runs entirely on the host against a fake `smolvm` on `PATH`, so it
-needs no VM, no network, and no account.
+The suite runs entirely on the host against fake `smolvm` and `podman` on
+`PATH`, so it needs no VM, no network, and no account. The backend contract is
+asserted on **both** backends — exit status, the lock, shape reconciliation,
+and cleanup are run once per backend — because a guarantee that only holds for
+one runtime is not a guarantee bx can make. Nesting is tested by running a real
+second `bx` as the outer machine's command, so depth-2 composition is exercised
+rather than assumed.
 
 `tests/invariants.sh` is the second suite: it turns each `never`/`only` claim
 in these docs into an assertion, and greps everything bx writes for a sentinel
-secret. It runs on the host by default; `BX_REAL=1` adds a real isolation suite that
-boots a machine and checks the isolation fence directly.
+secret. It runs on the host by default; `BX_REAL=1` adds a real isolation suite
+that boots a machine and checks the isolation fence directly. It runs on
+whichever backend can actually boot — a vm where a hypervisor exists, a
+container where `podman` works (including a host that is itself a bx machine) —
+so the fence is asserted on the container backend too, not only on smolvm.
 
 `scripts/demo.sh` shows the boundary (and refuses to fake it without a real
 `smolvm`); `scripts/bench.sh` produces the Cost table above, and prints no

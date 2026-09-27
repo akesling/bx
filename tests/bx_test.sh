@@ -91,6 +91,146 @@ FAKE
 }
 _remove_fake_podman() { rm -rf "$_fake_podman_dir"; }
 
+# ── nesting: composition, proved by running a second bx ─────────────────────
+# The point of `runtime_args` is that a machine can host a second bx. That is a
+# claim about *composition* — the two levels must not share a lock, a state
+# dir, or a machine name — and it can be proved on the host by making the
+# fake's `exec` actually run a real inner bx instead of faking it. A fake that
+# returned 0 would prove nothing about the second level; this one hands the
+# wheel to the other half of the tree.
+#
+# The fake also stands in for the guest filesystem: the outer recipe mounts
+# `$hostdir:/work`, so the fake maps the guest's `/work` back to `$hostdir`
+# before running the command. Without that the inner bx would look for its
+# recipe at the host's literal `/work` and find the wrong tree.
+_fake_nesting_dir=""
+_fake_nesting_mount=""
+_install_fake_nesting() {
+  _fake_nesting_dir="$(mktemp -d)"
+  cat >"${_fake_nesting_dir}/podman" <<'FAKE'
+#!/usr/bin/env bash
+# `exec -i [-e VAL ...] NAME bash -lc CMD` runs CMD here, in the *outer*
+# "guest", which in this test is the host. Parsed by flag arity, since `-e`
+# takes a separate value.
+if [[ "$1" == "exec" ]]; then
+  shift
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      -i|-t) shift ;;
+      -e)    shift 2 ;;
+      -*)    shift ;;
+      *)     break ;;
+    esac
+  done
+  [[ "$#" -gt 0 ]] && shift            # the machine name
+  while [[ "$#" -gt 0 && "$1" != "bash" ]]; do shift; done
+  [[ "$#" -gt 0 ]] && shift            # bash
+  [[ "$#" -gt 0 ]] && shift            # -lc
+  # The guest's /work is the host's $BX_FAKE_GUEST_WORK; model the mount by
+  # running there, exactly as the container would.
+  if [[ -n "${BX_FAKE_GUEST_WORK:-}" ]]; then
+    cd "$BX_FAKE_GUEST_WORK" || exit 1
+  fi
+  exec bash -lc "${1:-true}"
+fi
+case "$1" in
+  ps) for _n in ${FAKE_CONTAINERS:-}; do printf '%s\n' "$_n"; done ;;
+  image) exit 1 ;;
+  size) printf '0\n' ;;
+  exists) exit 0 ;;
+esac
+exit 0
+FAKE
+  chmod +x "${_fake_nesting_dir}/podman"
+}
+_remove_fake_nesting() { rm -rf "$_fake_nesting_dir"; }
+
+test_bx_in_bx_composes() {
+  _current="a second bx runs inside a bx machine, with its own state"
+  local d out
+  d="$(_new_workdir)"
+  # The inner recipe and its workspace live inside the outer machine's mount.
+  mkdir -p "$d/work"
+  cat >"$d/work/.bx.conf" <<'CONF'
+[inner]
+backend = podman
+image   = debian:bookworm-slim
+command = printf 'INNER-OK:%s\n' "$(pwd)"
+CONF
+  # The outer command runs the inner bx against the inner recipe. The fake
+  # models the mount, so the command's cwd is the workspace; a *relative*
+  # state dir therefore lands inside it, which is what a real guest would get
+  # from `/work/inner-state`.
+  cat >"$d/.bx.conf" <<CONF
+[outer]
+backend      = podman
+image        = debian:bookworm-slim
+runtime_args = --privileged
+mounts       = $d/work:/work
+command      = BX_BACKEND=podman BX_STATE_DIR=inner-state BX_NAME=inner \
+                 PATH=$_fake_nesting_dir:\$PATH ${_bx} inner
+CONF
+  out="$(cd "$d" && BX_BACKEND=podman BX_NAME=outer BX_STATE_DIR="$d/outer-state" \
+    BX_FAKE_GUEST_WORK="$d/work" PATH="${_fake_nesting_dir}:$PATH" "$_bx" outer 2>&1)"
+  assert_contains "INNER-OK:" "$out" "the inner bx ran and exec'd its command"
+  # The two levels must not share state.
+  if [[ -f "$d/outer-state/outer.state" && -f "$d/work/inner-state/inner.state" ]]; then
+    _ok
+  else
+    _fail "the two levels should record separate state files"
+  fi
+  # The outer machine's recorded shape must carry the widening flag, so the
+  # nesting capability is auditable at the level that declared it.
+  assert_contains "--privileged" "$(cat "$d/outer-state/outer.state")" \
+    "the outer shape records the runtime_args that enable nesting"
+  rm -rf "$d"
+}
+
+# The lock is per machine *name*, and names are per level, so an inner machine
+# must stay reachable even while an outer one is held. This is the property
+# that makes recursion safe rather than merely possible.
+test_bx_in_bx_locks_are_per_level() {
+  _current="inner and outer locks are independent"
+  local d out rc
+  d="$(_new_workdir)"
+  mkdir -p "$d/work"
+  cat >"$d/work/.bx.conf" <<'CONF'
+[inner]
+backend = podman
+image   = debian:bookworm-slim
+command = true
+CONF
+  # Hold the OUTER machine's lock, then run the inner bx. The outer run is
+  # blocked (expected); the inner one must not be.
+  mkdir -p "$d/state/outer.lock.d"
+  printf '%s\n' "$$" >"$d/state/outer.lock.d/pid"
+  cat >"$d/.bx.conf" <<CONF
+[outer]
+backend = podman
+image   = debian:bookworm-slim
+mounts  = $d/work:/work
+command = BX_BACKEND=podman BX_STATE_DIR=inner-state BX_NAME=inner \
+            PATH=$_fake_nesting_dir:\$PATH ${_bx} inner
+CONF
+  out="$(cd "$d" && BX_BACKEND=podman BX_NAME=outer BX_STATE_DIR="$d/state" \
+    PATH="${_fake_nesting_dir}:$PATH" "$_bx" outer 2>&1)"
+  rc=$?
+  assert_eq "1" "$rc" "the held outer lock blocks the outer run"
+  assert_contains "already being driven" "$out" "the outer run names the holder"
+  # The inner name is free, because it is a different machine at a different
+  # level with its own state dir.
+  out="$(cd "$d/work" && BX_BACKEND=podman BX_NAME=inner \
+    BX_STATE_DIR="$d/work/inner-state" PATH="${_fake_nesting_dir}:$PATH" \
+    "$_bx" inner 2>&1)"
+  rc=$?
+  assert_eq "0" "$rc" "the inner machine's name is independent of the outer's"
+  rm -rf "$d"
+}
+
+_install_fake_smolvm
+_install_fake_nesting
+trap '_remove_fake_smolvm; _remove_fake_podman; _remove_fake_nesting' EXIT
+
 _new_workdir() {
   local d
   d="$(mktemp -d)"
@@ -1240,6 +1380,113 @@ test_backends_implement_the_same_verbs() {
   assert_eq "$_sm" "$_pd" "backends disagree on the verb set"
 }
 
+# ── the backend contract, exercised on *both* backends ──────────────────────
+# Verb presence is not a contract. These run the same observable behaviour
+# through each backend and assert the behaviour, not the wiring: a podman exec
+# that forgot to propagate the status, or a podman machine that skipped the
+# lock, would still pass the verb-present check above. `fake_for` puts the
+# right fake runtime on PATH and points BX_BACKEND at it, so one scenario body
+# runs against whichever backend is named.
+_fake_for() { # backend -> directory holding just that fake, sets $FAKE_DIR/$FAKE_CALLS
+  case "$1" in
+    smolvm) FAKE_DIR="$_fake_bin_dir"; FAKE_CALLS="$_fake_log";;
+    podman) FAKE_DIR="$_fake_podman_dir"; FAKE_CALLS="$_fake_podman_log";;
+    *) _fail "no fake for backend '$1'"; return 1;;
+  esac
+}
+
+# Both backends must exit with the guest command's status, not flatten it.
+test_exit_status_parity() {
+  _current="exit status propagates on every backend"
+  local _b d rc
+  for _b in smolvm podman; do
+    _fake_for "$_b" || return
+    d="$(_new_workdir)"
+    ( cd "$d" && BX_BACKEND="$_b" BX_NAME="rc-$_b" BX_COMMAND="false" \
+      BX_STATE_DIR="$d/local" FAKE_EXEC_RC=7 \
+      PATH="${FAKE_DIR}:$PATH" "$_bx" >/dev/null 2>&1 )
+    rc=$?
+    assert_eq "7" "$rc" "$_b preserves the guest exit status"
+    rm -rf "$d"
+  done
+}
+
+# Both backends must refuse a live lock, and recover from a dead one. A second
+# run sharing the first's vm is the failure this exists to prevent, and it is
+# as wrong for a container as for a vm.
+test_lock_parity() {
+  _current="the lock blocks and recovers on every backend"
+  local _b d out rc
+  for _b in smolvm podman; do
+    _fake_for "$_b" || return
+    d="$(_new_workdir)"
+    mkdir -p "$d/local/lk-$_b.lock.d"
+    printf '%s\n' "$$" >"$d/local/lk-$_b.lock.d/pid"
+    out="$(cd "$d" && BX_BACKEND="$_b" BX_NAME="lk-$_b" BX_COMMAND=true \
+      BX_STATE_DIR="$d/local" PATH="${FAKE_DIR}:$PATH" "$_bx" 2>&1)"
+    rc=$?
+    assert_eq "1" "$rc" "$_b refuses a held lock"
+    assert_contains "already being driven" "$out" "$_b names the holder"
+    rm -rf "$d"
+  done
+}
+
+# Both backends must reconcile, not silently reuse, a machine whose shape
+# changed. This is the property the whole tool is built around; it cannot be a
+# vm-only guarantee.
+test_shape_reconcile_parity() {
+  _current="a changed mount set conflicts on every backend"
+  local _b d out
+  for _b in smolvm podman; do
+    _fake_for "$_b" || return
+    d="$(_new_workdir)"
+    cat >"$d/local/sh-$_b.state" <<STATE
+image=debian:bookworm-slim
+cpus=4
+mem=4096
+net=bridge
+backend=$_b
+mounts:
+/old:/old
+STATE
+    out="$(cd "$d" && BX_BACKEND="$_b" BX_NAME="sh-$_b" BX_MOUNTS="/new:/new" \
+      BX_COMMAND=true BX_STATE_DIR="$d/local" FAKE_VMS="sh-$_b" \
+      FAKE_CONTAINERS="sh-$_b" PATH="${FAKE_DIR}:$PATH" "$_bx" 2>&1)"
+    assert_contains "different shape" "$out" "$_b refuses the reused machine"
+    assert_contains "--reset" "$out" "$_b names the fix"
+    rm -rf "$d"
+  done
+}
+
+# And both must finish the lifecycle: stop the machine and release the lock on
+# the way out, including when the guest command failed.
+test_cleanup_parity() {
+  _current="stop and unlock happen on every backend, even on failure"
+  local _b d calls rc
+  for _b in smolvm podman; do
+    _fake_for "$_b" || return
+    d="$(_new_workdir)"
+    : >"$FAKE_CALLS"
+    ( cd "$d" && BX_BACKEND="$_b" BX_NAME="cl-$_b" BX_COMMAND=false \
+      BX_STATE_DIR="$d/local" FAKE_EXEC_RC=3 PATH="${FAKE_DIR}:$PATH" \
+      "$_bx" >/dev/null 2>&1 )
+    rc=$?
+    calls="$(cat "$FAKE_CALLS" 2>/dev/null)"
+    assert_eq "3" "$rc" "$_b keeps the failed status through cleanup"
+    if [[ "$_b" == "smolvm" ]]; then
+      assert_contains "machine stop" "$calls" "$_b stops a failed machine"
+    else
+      assert_contains "stop cl-$_b" "$calls" "$_b stops a failed container"
+    fi
+    if [[ -d "$d/local/cl-$_b.lock.d" ]]; then
+      _fail "$_b left the lock behind after a failed run"
+    else
+      _ok
+    fi
+    rm -rf "$d"
+  done
+}
+
 _install_fake_smolvm
 trap '_remove_fake_smolvm; _remove_fake_podman' EXIT
 
@@ -1668,8 +1915,15 @@ test_no_runtime_args_is_the_default
 
 # The engine is only unified if every backend implements the same verbs. A new
 # backend that forgets one would fail at the call site, deep in a run; catch it
-# here, where the fix is obvious.
+# here, where the fix is obvious. The parity tests go further: presence is not
+# a contract, so the same observable behaviour is asserted on both backends.
 test_backends_implement_the_same_verbs
+test_exit_status_parity
+test_lock_parity
+test_shape_reconcile_parity
+test_cleanup_parity
+test_bx_in_bx_composes
+test_bx_in_bx_locks_are_per_level
 
 printf '\n%d passed, %d failed\n' "$_passed" "$_failed"
 [[ "$_failed" -eq 0 ]]

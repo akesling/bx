@@ -384,32 +384,144 @@ test_runtime_args_are_never_inferred() {
   _pass
 }
 
-# ── real: isolation, only when asked ────────────────────────────────────────
-# This is the claim the README leads with: the host home directory is not
-# mounted. It cannot be tested with a fake smolvm, so it is opt-in.
-test_real_home_is_not_mounted() {
-  _current="the host home directory is not visible in the guest"
-  local d out
+# The README now claims the backend contract is asserted on *both* backends and
+# that the real fence runs on whichever can boot. Those are the guarantees that
+# turn the engine from a dispatch table into an abstraction, so pin them: the
+# parity tests must still iterate over both names, and the real runner must
+# still probe rather than hardcode smolvm.
+test_backend_contract_is_asserted_on_every_backend() {
+  _current="the backend contract and the real fence cover every backend"
+  local _t="${_repo_root}/tests/bx_test.sh" _i="${_repo_root}/tests/invariants.sh"
+  # The parity scenarios must loop over the declared backends. If someone
+  # narrows one to smolvm, the guarantee is gone and this says so.
+  local _scenario
+  for _scenario in test_exit_status_parity test_lock_parity \
+                   test_shape_reconcile_parity test_cleanup_parity; do
+    if ! sed -n "/^${_scenario}()/,/^}/p" "$_t" | grep -q 'for _b in smolvm podman'; then
+      _fail "${_scenario} no longer runs on both backends"
+      return
+    fi
+  done
+  # The real runner must discover what can boot, not gate on the vm predicate.
+  # Scoped to the runner block: `_smolvm_can_boot` still exists and is tested
+  # elsewhere, so a whole-file grep would flag its own test.
+  local _runner
+  _runner="$(sed -n '/^if \[\[ "${BX_REAL:-0}" == "1" \]\]/,/^fi/p' "$_i")"
+  if ! grep -q '_real_backend_runnable' <<<"$_runner"; then
+    _fail "the real suite no longer probes which backend can boot"
+    return
+  fi
+  if grep -q '_smolvm_can_boot' <<<"$_runner"; then
+    _fail "the real runner still gates on the smolvm predicate alone"
+    return
+  fi
+  _pass
+}
+
+# ── real: isolation, on whichever backend can actually run ──────────────────
+# The fence is bx's reason to exist, so it must be asserted on every backend
+# that can boot, not only the vm. These take the backend as an argument: the
+# runner below picks one that works on this host, so a Linux box with podman
+# exercises the container fence and a Mac exercises the vm fence. A claim that
+# only holds on smolvm is not a property of bx.
+#
+# `cat` of a host file that exists is the test: if the guest prints the
+# sentinel, the file crossed the boundary. `|| true` keeps a refusal from
+# looking like a runner failure.
+#
+# Names carry the pid and BX_RESET=1, so a re-run never collides with a machine
+# a previous run left behind (the state dir is fresh, but the machine is not
+# always deleted) — that collision once looked exactly like a fence failure.
+_real_name() { printf 'bxinv-%s-%s-%s' "$1" "$2" "$$"; }
+
+# Remove a machine this suite created, so a re-run starts clean. bx stops a
+# machine but does not delete it, and a leftover name with no recorded shape is
+# exactly the collision that once masqueraded as a fence failure. Deleting
+# through the backend directly is deliberate: `bx --reset` needs a state file
+# to reconcile against, and this cleanup is removing the thing state would
+# describe.
+_real_cleanup() { # backend name
+  case "$1" in
+    smolvm) smolvm machine delete --name "$2" -f >/dev/null 2>&1 || true ;;
+    podman) podman rm -f "$2" >/dev/null 2>&1 || true ;;
+  esac
+}
+
+test_real_home_is_not_mounted() { # backend
+  local _b="$1" d out _name _needle
+  _current="[$_b] the host home directory is not visible in the machine"
   d="$(_new_tmp)"
-  printf 'sentinel\n' >"${HOME}/.bx-invariants-sentinel"
-  out="$(cd "$d" && BX_NAME=inv-home BX_BACKEND=smolvm BX_COMMAND="cat \$HOME/.bx-invariants-sentinel 2>&1 || true" \
+  _name="$(_real_name "$_b" home)"
+  # The needle is a value that appears only in the file's *contents*, never in
+  # the path we ask for: echoing `${HOME}/...-sentinel` in a `cat:` error would
+  # otherwise match the needle and look exactly like a leak.
+  _needle="LEAKED_$(date +%s)_$RANDOM"
+  printf '%s\n' "$_needle" >"${HOME}/.bx-invariants-home"
+  out="$(cd "$d" && BX_NAME="$_name" BX_BACKEND="$_b" \
+    BX_RESET=1 BX_MOUNTS="$d:/work" BX_WORKDIR=/work \
+    BX_COMMAND="cat \$HOME/.bx-invariants-home 2>&1 || true" \
     BX_STATE_DIR="$d/state" BX_KEEP=0 "$_bx" 2>&1)"
-  assert_absent "sentinel" "$out" "the guest read a host home-directory file"
-  rm -f "${HOME}/.bx-invariants-sentinel"
+  assert_absent "$_needle" "$out" "[$_b] the machine read a host home-directory file"
+  rm -f "${HOME}/.bx-invariants-home"
+  _real_cleanup "$_b" "$_name"
   rm -rf "$d"
 }
 
 # The project mount must work — the fence must not be so tight the agent can't
 # edit. Paired with the test above, this is the whole isolation story.
-test_real_project_is_mounted() {
-  _current="the project directory is writable inside the guest"
-  local d out
+test_real_project_is_mounted() { # backend
+  local _b="$1" d out _name
+  _current="[$_b] the project directory is writable inside the machine"
   d="$(_new_tmp)"
-  out="$(cd "$d" && BX_NAME=inv-proj BX_BACKEND=smolvm \
+  _name="$(_real_name "$_b" proj)"
+  out="$(cd "$d" && BX_NAME="$_name" BX_BACKEND="$_b" \
+    BX_RESET=1 BX_MOUNTS="$d:/work" BX_WORKDIR=/work \
     BX_COMMAND="echo from-guest > /work/invariants-probe && cat /work/invariants-probe" \
     BX_STATE_DIR="$d/state" "$_bx" 2>&1)"
-  assert_present "from-guest" "$out" "the guest could not write the mount"
+  assert_present "from-guest" "$out" "[$_b] the machine could not write the mount"
+  # The write must land on the host's copy of the mount, or the mount is a lie.
+  if [[ "$(cat "$d/invariants-probe" 2>/dev/null)" == "from-guest" ]]; then
+    _pass
+  else
+    _fail "[$_b] the guest write did not reach the host mount"
+  fi
+  _real_cleanup "$_b" "$_name"
   rm -rf "$d"
+}
+
+# A mount the recipe does *not* name must not appear, whatever the backend.
+# This is the negative form of the project-mount test, and the property that
+# keeps nesting from widening by accident: the child sees its own mounts only.
+test_real_undeclared_path_is_absent() { # backend
+  local _b="$1" d out sibling _name _needle
+  _current="[$_b] a path that is not mounted is not visible"
+  d="$(_new_tmp)"
+  _name="$(_real_name "$_b" unmnt)"
+  sibling="$(mktemp -d)"
+  _needle="LEAKED_$(date +%s)_$RANDOM"
+  printf '%s\n' "$_needle" >"$sibling/secret"
+  out="$(cd "$d" && BX_NAME="$_name" BX_BACKEND="$_b" \
+    BX_RESET=1 BX_MOUNTS="$d:/work" BX_WORKDIR=/work \
+    BX_COMMAND="cat $sibling/secret 2>&1 || true" \
+    BX_STATE_DIR="$d/state" BX_KEEP=0 "$_bx" 2>&1)"
+  assert_absent "$_needle" "$out" "[$_b] a sibling directory leaked into the machine"
+  _real_cleanup "$_b" "$_name"
+  rm -rf "$d" "$sibling"
+}
+
+# Which backends can actually boot here. smolvm needs a hypervisor; podman
+# needs a working container runtime (and, when nested, the guest it runs in).
+_real_backend_runnable() { # backend -> 0 if it can boot on this host
+  local _b="$1" d _name
+  d="$(_new_tmp)"
+  _name="$(_real_name "$_b" probe)"
+  if ( cd "$d" && BX_NAME="$_name" BX_BACKEND="$_b" \
+       BX_COMMAND=true BX_RESET=1 BX_MOUNTS="$d:/work" BX_WORKDIR=/work \
+       BX_STATE_DIR="$d/state" "$_bx" >/dev/null 2>&1 ); then
+    _real_cleanup "$_b" "$_name"
+    rm -rf "$d"; return 0
+  fi
+  rm -rf "$d"; return 1
 }
 
 # ── runner ──────────────────────────────────────────────────────────────────
@@ -428,16 +540,25 @@ test_containers_claim_is_documented
 test_backend_choice_is_documented
 test_net_mode_choice_is_documented
 test_runtime_args_are_never_inferred
+test_backend_contract_is_asserted_on_every_backend
 
 if [[ "${BX_REAL:-0}" == "1" ]]; then
-  # Use the shipping predicate, not a copy: a bare /dev/kvm check would skip
-  # the Mac, which is a first-class host.
-  . "${_repo_root}/scripts/lib.sh"
-  if _smolvm_can_boot; then
-    test_real_home_is_not_mounted
-    test_real_project_is_mounted
-  else
-    printf 'bx-invariants: BX_REAL=1 but no smolvm or hypervisor; skipping real suite\n' >&2
+  # Run the fence on every backend that can actually boot here, not just the
+  # one the smolvm predicate happens to know about. A host that can run podman
+  # but not a vm (a CI container, or bx nested in bx) now exercises the fence
+  # instead of skipping the whole suite.
+  _ran_real=0
+  for _candidate in smolvm podman; do
+    if _real_backend_runnable "$_candidate"; then
+      printf 'bx-invariants: real suite on %s\n' "$_candidate" >&2
+      test_real_home_is_not_mounted "$_candidate"
+      test_real_project_is_mounted "$_candidate"
+      test_real_undeclared_path_is_absent "$_candidate"
+      _ran_real=1
+    fi
+  done
+  if [[ "$_ran_real" == "0" ]]; then
+    printf 'bx-invariants: BX_REAL=1 but no backend can boot here; skipping real suite\n' >&2
   fi
 fi
 

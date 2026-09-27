@@ -14,8 +14,10 @@ fi
 # so `sh` being dash does not break the suite.
 bash tests/bx_test.sh
 # The invariants harness turns the docs' never/only claims into assertions and
-# greps everything bx writes for a sentinel secret. The real isolation
-# suite is opt-in via BX_REAL=1, so this stays host-only and hermetic.
+# greps everything bx writes for a sentinel secret. The real isolation suite is
+# opt-in via BX_REAL=1, so this stays host-only and hermetic; when enabled it
+# runs the fence on whatever backend can actually boot here (a vm on a
+# hypervisor host, a container where podman works), not just smolvm.
 bash tests/invariants.sh
 # The bench harness must at minimum run and refuse to invent numbers.
 bash scripts/bench.sh --fake >/dev/null
