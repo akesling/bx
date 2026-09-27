@@ -1544,6 +1544,112 @@ test_net_modes_reach_the_vm() {
   rm -rf "$d"
 }
 
+# `runtime_args` are the backend's own flags, passed through verbatim. The whole
+# point is that bx does not translate them, so the test is that the exact text
+# reaches the create argv and nothing rewrites it.
+test_runtime_args_reach_the_create_argv() {
+  _current="runtime_args reach the create argv verbatim"
+  local d calls
+  d="$(_new_workdir)"
+  : >"$_fake_podman_log"
+  cat >"$d/.bx.conf" <<'CONF'
+[ctr]
+backend      = podman
+image        = debian:bookworm-slim
+runtime_args = --privileged
+runtime_args = --cgroupns=host
+mounts       = /only:/only
+command      = true
+CONF
+  (cd "$d" && FAKE_CONTAINERS="" BX_NAME=ra BX_STATE_DIR="$d/local" \
+    PATH="${_fake_podman_dir}:$PATH" "$_bx" ctr >/dev/null 2>&1)
+  calls="$(cat "$_fake_podman_log" 2>/dev/null)"
+  assert_contains "--privileged" "$calls" "the first flag reaches create"
+  assert_contains "--cgroupns=host" "$calls" "the second flag reaches create"
+  rm -rf "$d"
+}
+
+# They are bound at create time, so changing them cannot apply to a running
+# machine; a changed set must reconcile like any other shape change.
+test_runtime_args_are_part_of_the_shape() {
+  _current="changing runtime_args is a shape change"
+  local d out
+  d="$(_new_workdir)"
+  cat >"$d/local/ra.state" <<'STATE'
+image=debian:bookworm-slim
+cpus=4
+mem=4096
+net=host
+backend=podman
+mounts:
+/only:/only
+runtime_args:
+--privileged
+STATE
+  cat >"$d/.bx.conf" <<'CONF'
+[ctr]
+backend      = podman
+image        = debian:bookworm-slim
+net          = host
+runtime_args = --privileged
+runtime_args = --cap-add=SYS_ADMIN
+mounts       = /only:/only
+command      = true
+CONF
+  out="$(cd "$d" && FAKE_CONTAINERS=ra BX_NAME=ra BX_STATE_DIR="$d/local" \
+    PATH="${_fake_podman_dir}:$PATH" "$_bx" ctr 2>&1)"
+  assert_contains "different shape" "$out" "added runtime_args is a conflict"
+  rm -rf "$d"
+}
+
+# The plan has to show what the fence was opened with, or --dry-run is not a
+# plan. The warning is the create-time half of the same promise.
+test_runtime_args_are_reported() {
+  _current="runtime_args appear in the plan, and warn when they widen"
+  local d out
+  d="$(_new_workdir)"
+  cat >"$d/.bx.conf" <<'CONF'
+[ctr]
+backend      = podman
+image        = debian:bookworm-slim
+runtime_args = --privileged
+mounts       = /only:/only
+command      = true
+CONF
+  out="$(cd "$d" && BX_NAME=ra2 BX_STATE_DIR="$d/state" BX_DRY_RUN=1 \
+    PATH="${_fake_podman_dir}:$PATH" "$_bx" ctr 2>&1)"
+  assert_contains "runtime_args:" "$out" "the plan names the raw flags"
+  assert_contains "--privileged" "$out" "the plan shows the flag itself"
+  out="$(cd "$d" && FAKE_CONTAINERS="" BX_VERBOSE=1 BX_NAME=ra3 \
+    BX_STATE_DIR="$d/local" PATH="${_fake_podman_dir}:$PATH" "$_bx" ctr 2>&1)"
+  assert_contains "raw runtime flags" "$out" "create warns that raw flags were passed"
+  rm -rf "$d"
+}
+
+# With no runtime_args, none of the widening machinery should appear: the flag
+# is explicit-only, and bx must never invent one.
+test_no_runtime_args_is_the_default() {
+  _current="runtime_args are never inferred"
+  local d out calls
+  d="$(_new_workdir)"
+  : >"$_fake_podman_log"
+  cat >"$d/.bx.conf" <<'CONF'
+[ctr]
+backend = podman
+image   = debian:bookworm-slim
+mounts  = /only:/only
+command = true
+CONF
+  out="$(cd "$d" && BX_NAME=ra4 BX_STATE_DIR="$d/state" BX_DRY_RUN=1 \
+    PATH="${_fake_podman_dir}:$PATH" "$_bx" ctr 2>&1)"
+  assert_not_contains "runtime_args" "$out" "the plan omits it when unset"
+  (cd "$d" && FAKE_CONTAINERS="" BX_NAME=ra5 BX_STATE_DIR="$d/local" \
+    PATH="${_fake_podman_dir}:$PATH" "$_bx" ctr >/dev/null 2>&1)
+  calls="$(cat "$_fake_podman_log" 2>/dev/null)"
+  assert_not_contains "--privileged" "$calls" "no privileged flag is invented"
+  rm -rf "$d"
+}
+
 test_net_modes_reach_the_container
 test_net_boolean_still_means_a_mode
 test_net_bogus_mode_is_rejected
@@ -1553,6 +1659,10 @@ test_net_unset_under_tsi_uses_host
 test_net_bridge_approved_becomes_host
 test_net_bridge_kept_on_a_normal_host
 test_net_modes_reach_the_vm
+test_runtime_args_reach_the_create_argv
+test_runtime_args_are_part_of_the_shape
+test_runtime_args_are_reported
+test_no_runtime_args_is_the_default
 
 
 

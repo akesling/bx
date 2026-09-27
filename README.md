@@ -314,6 +314,52 @@ container machine is a second long-lived, mutable thing, and it earns the same
 reclamation question a vm does. `backend = podman` makes bx answer that
 question for containers too, instead of leaving it to the agent.
 
+#### Nesting: a machine that can itself run machines
+
+A container is not automatically able to run a container inside it, but a
+recipe can make it so. Two things are needed, and neither is a magic word:
+
+1. **`runtime_args`** passes the runtime's own create-time flags through
+   verbatim. podman needs `--privileged` (and `--cgroupns=host`) before a
+   runtime inside it can run: a nested runtime raises memory-lock limits and
+   writes cgroup files an unprivileged container cannot. bx does not infer
+   this — `--privileged` reaches well past the mount set bx controls, so it is
+   the one place a recipe widens the fence. It must be asked for, it is
+   recorded **in the shape**, and it is warned about at create time.
+
+2. **A `bootstrap`** installs the runtime and points its storage at a `vfs`
+   driver. The guest rootfs is itself an overlayfs, and podman's default
+   `overlay` driver refuses to start over one. This is ordinary bootstrap
+   work, not a new concept.
+
+The shipped `nested_podman` machine is exactly those two things, so a recipe
+that wants to nest only has to name it:
+
+```ini
+# ~/.bx/recipes/bxinbx.conf — a machine a second bx can run inside
+[outer]
+machine = nested_podman
+command = bash -lc 'cd /work && bx inner'
+```
+
+Depth composes, because nothing about `runtime_args` or `bootstrap` is
+special to the first level: the child `bx` sees a machine that is itself a
+normal bx machine, and a recipe that names `nested_podman` again (or `extends`
+it) nests once more. Mounts compose the same way and just as explicitly — a
+child sees exactly the mounts its own recipe names, so a directory visible at
+depth 1 is not visible at depth 2 unless the depth-2 recipe asks for it.
+
+The fence holds at every depth. A depth-2 test reads the depth-1 machine's
+`/root/.bx-nested-sentinel` and the depth-1 host directory and is refused
+both; it sees only its own declared mounts. The recorded shape reconciles at
+every level too — changing the inner recipe's `net` or `runtime_args` is a
+shape conflict one layer down, with the same diff and the same `--reset`.
+
+What this costs: `runtime_args = --privileged` gives the container near-host
+reach, which is the opposite of the fence the rest of bx maintains. It is
+offered because recursion is a real use, not because it is safe by default.
+See [What bx does not control](#what-bx-does-not-control).
+
 
 ## Costs
 
@@ -504,6 +550,7 @@ a key is read from the environment, as a recipe key, or both; `profile`,
 | `BX_CPUS` / `BX_MEM` | both | `4` / `4096` | vCPUs / MiB |
 | `BX_NET` | both | `bridge` | network mode: `none`, `bridge`, or `host`; `1`/`0` mean `bridge`/`none`. Unset, bx picks `host` in a nested (TSI) guest, since a bridge cannot route there |
 | `BX_NET_APPROVED` | env | `0` | `1` approves switching a nested container to `host` networking without editing the recipe |
+| `BX_RUNTIME_ARGS` | both | — | newline-separated backend-native create flags, passed through verbatim; this is how a recipe widens the fence (e.g. `--privileged` to nest). Never inferred; part of the shape; warned about at create time |
 | `BX_BACKEND` | both | — | the runtime that owns the machine: `smolvm` (a microVM) or `podman` (a container). Unset, bx uses the only one installed, and asks when both are (see below) |
 | `BX_BACKEND_PROMPT` | both | `0` | `1` to be asked for the backend even when only one is installed |
 | `BX_MOUNTS` | both | — | newline-separated `HOST:GUEST` pairs |

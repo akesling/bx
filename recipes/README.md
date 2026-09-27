@@ -116,6 +116,7 @@ Every `bx` setting is a recipe key:
 | `name` | machine name |
 | `cpus` / `mem` | vCPUs / MiB |
 | `net` | network mode: `none`, `bridge` (runtime NAT, default), or `host` (share the runtime's namespace). `1`/`0` still mean `bridge`/`none` |
+| `runtime_args` | the backend's own create-time flags, passed through verbatim (repeatable). podman and smolvm each get their own; bx never infers or defaults them. This is how a recipe widens the fence — e.g. `--privileged` to run containers inside a container — so it is part of the shape and warned about at create time |
 | `mounts` | `HOST:GUEST` pairs (repeatable) |
 | `workdir` | guest directory to run in |
 | `keep` / `reset` | lifecycle flags |

@@ -45,8 +45,8 @@
 # are never shell-evaluated.
 #
 # Recipe keys (every bx setting, plus four):
-#   command, image, name, cpus, mem, net, mounts, workdir, keep, reset,
-#   bootstrap, bootstrap_env, secret_env, pre_command, name, state_dir,
+#   command, image, name, cpus, mem, net, runtime_args, mounts, workdir, keep,
+#   reset, bootstrap, bootstrap_env, secret_env, pre_command, name, state_dir,
 #   backend, backend_prompt, profile, extends, resolve, machine
 # `backend` is the runtime that owns the machine: `smolvm` (a microVM) or
 # `podman` (a container; use it inside a machine, where a vm cannot boot). It
@@ -61,9 +61,18 @@
 # container on `bridge` cannot reach the network inside a vm with user-mode
 # (krun/TSI) networking, so that combination is refused with the fix: set
 # `net = host`, which is the explicit approval to share the guest's namespace.
-# `mounts`, `bootstrap_env`, and `secret_env` may repeat; their lines are kept
-# in order. `#` starts a comment; values run to end of line after trimming. A
-# value continues on following lines if those lines are indented.
+#
+# `runtime_args` is a repeatable list of the backend's own create-time flags,
+# passed through verbatim (podman takes `--privileged`, smolvm takes its own
+# equivalents). bx never infers or defaults them: it is the one key that can
+# widen the fence past the mount set, so a recipe must ask for it, it is part of
+# the shape, and it is warned about at create time. This is how a capability the
+# backend has but bx has no vocabulary for — running a container inside a
+# container, say — is declared without inventing a euphemism for `--privileged`.
+# It is how nesting is expressed; see `machines/nested_podman.conf`.
+# `mounts`, `runtime_args`, `bootstrap_env`, and `secret_env` may repeat; their
+# lines are kept in order. `#` starts a comment; values run to end of line after
+# trimming. A value continues on following lines if those lines are indented.
 #
 # The command runs through `bash -lc` (or `-i -t` when attached to a terminal)
 # and its exit status becomes this script's exit status. Extra arguments after
@@ -409,7 +418,14 @@ bk_smolvm_secret_arg() { _secret_args+=(--secret-env "${_secret_guest}=${_secret
 bk_smolvm_secret_export() { printf '0'; }
 
 # Build the create argv for a machine. Reads `_vm_name`, `_image`, `_vm_cpus`,
-# `_vm_mem`, `_net`, `_want_mounts`; writes `_create_args`.
+# `_vm_mem`, `_net`, `_want_mounts`, `_want_runtime_args`; writes `_create_args`.
+#
+# `_want_runtime_args` is passed through verbatim: these are the runtime's own
+# flags, and bx does not know or judge them. This is how a capability the
+# backend has but bx has no vocabulary for (running a container inside a
+# container) is declared from a recipe without inventing a euphemism for it.
+# The recipe approves it; bx records and warns about it. See the `runtime_args`
+# note above the `_runtime_args_set` check.
 bk_smolvm_create_args() {
   _create_args=(--name "$_vm_name" --image "$_image" --cpus "$_vm_cpus" --mem "$_vm_mem")
   [[ "$_net" == "none" ]] || _create_args+=(--net)
@@ -418,6 +434,10 @@ bk_smolvm_create_args() {
     [[ -n "$_mount" ]] || continue
     _create_args+=(--volume "$_mount")
   done < <(printf '%s\n' "$_want_mounts")
+  while IFS= read -r _arg; do
+    [[ -n "$_arg" ]] || continue
+    _create_args+=("$_arg")
+  done < <(printf '%s\n' "$_want_runtime_args")
 }
 
 # smolvm spells both bootstrap env and host passthrough `--env NAME=VALUE`.
@@ -519,6 +539,12 @@ bk_podman_create_args() {
     [[ -n "$_mount" ]] || continue
     _create_args+=(-v "$_mount")
   done < <(printf '%s\n' "$_want_mounts")
+  # Backend-native flags, passed through unread (see bk_smolvm_create_args).
+  local _arg
+  while IFS= read -r _arg; do
+    [[ -n "$_arg" ]] || continue
+    _create_args+=("$_arg")
+  done < <(printf '%s\n' "$_want_runtime_args")
   _create_args+=(--entrypoint '' "$_image" sleep infinity)
 }
 
@@ -574,8 +600,8 @@ _usage() {
 # last file read wins) and appends to a multi-valued key (so all sources
 # contribute, in the order read: home, project, per-recipe).
 
-_recipe_keys="command image name cpus mem net mounts workdir keep reset bootstrap bootstrap_env secret_env pre_command state_dir backend backend_prompt profile extends resolve machine"
-_multi_keys="mounts bootstrap_env secret_env"
+_recipe_keys="command image name cpus mem net runtime_args mounts workdir keep reset bootstrap bootstrap_env secret_env pre_command state_dir backend backend_prompt profile extends resolve machine"
+_multi_keys="runtime_args mounts bootstrap_env secret_env"
 
 # A recipe key that is not a bx setting but describes the recipe itself.
 # `extends` and `resolve` are resolved before the recipe is merged.
@@ -586,7 +612,7 @@ _meta_keys="extends resolve machine"
 # with some of these and no `command`. A command recipe may name a machine with
 # `machine = ...` and override any of these keys; `--machine` on the command
 # line replaces them all. Kept as data so the two rules live in one place.
-_shape_keys="image name cpus mem net mounts workdir bootstrap bootstrap_env secret_env pre_command state_dir backend"
+_shape_keys="image name cpus mem net runtime_args mounts workdir bootstrap bootstrap_env secret_env pre_command state_dir backend"
 
 # ── secret lifetimes ─────────────────────────────────────────────────────────
 # A `secret_env` entry is `GUEST=HOSTVAR[:LIFETIME]`. The lifetime is bx's
@@ -1187,6 +1213,7 @@ _apply_recipe_key() { # key value
     cpus)          BX_CPUS="$_val" ;;
     mem)           BX_MEM="$_val" ;;
     net)           BX_NET="$_val" ;;
+    runtime_args)  BX_RUNTIME_ARGS="$_val" ;;
     mounts)        BX_MOUNTS="$_val" ;;
     workdir)       BX_WORKDIR="$_val" ;;
     keep)          BX_KEEP="$_val" ;;
@@ -1235,6 +1262,7 @@ _dump_recipe() {
   printf 'reset=%s\n' "${BX_RESET:-0}"
   [[ -n "${BX_PROFILE:-}" ]] && printf 'profile=%s\n' "$BX_PROFILE"
   printf 'mounts=\n%s\n' "${BX_MOUNTS:-(none)}"
+  [[ -n "${BX_RUNTIME_ARGS:-}" ]] && printf 'runtime_args=\n%s\n' "$BX_RUNTIME_ARGS"
   [[ -n "${BX_BOOTSTRAP_ENV:-}" ]] && printf 'bootstrap_env=\n%s\n' "$BX_BOOTSTRAP_ENV"
   [[ -n "${BX_SECRET_ENV:-}" ]] && printf 'secret_env=\n%s\n' "$BX_SECRET_ENV"
   [[ -n "${BX_PRE_COMMAND:-}" ]] && printf 'pre_command=%s\n' "$BX_PRE_COMMAND"
@@ -1396,7 +1424,7 @@ _state_block() { # statefile key
 # the lifecycle otherwise leaves implicit. Each machine is read from its own
 # recorded backend, so a vm and a container can be listed side by side.
 _status_action() {
-  local _name _file _origin _dir_ok _running _lifetimes _size _found=0 _b
+  local _name _file _origin _dir_ok _running _lifetimes _size _found=0 _b _rargs
   while IFS= read -r _name; do
     [[ -n "$_name" ]] || continue
     _found=1
@@ -1430,6 +1458,11 @@ _status_action() {
     printf 'runtime:  %s\n' "$_running"
     printf 'size:     %s\n' "$_size"
     [[ -n "$_lifetimes" ]] && printf 'secrets:  %s\n' "$_lifetimes"
+    # Raw runtime flags are shown whenever they were used, so a machine that
+    # was created with a widened fence is never invisible in a listing.
+    _rargs="$(_state_block "$_file" runtime_args)"
+    _rargs="${_rargs//$'\n'/, }"
+    [[ -n "$_rargs" ]] && printf 'runtime_args: %s\n' "$_rargs"
     printf 'state:    %s\n' "$_file"
     printf '\n'
   done < <(_state_machines)
@@ -1554,6 +1587,12 @@ fi
 # line, so it can be diffed and stored verbatim.
 _want_mounts="$(_read_lines "${BX_MOUNTS:-}")"
 
+# Backend-native create flags, one per line, order preserved — the same shape as
+# `mounts`. They are read once here so the shape, `--dry-run`, and the create
+# argv all agree byte-for-byte, and so a flag containing spaces survives as one
+# argument rather than being re-split.
+_want_runtime_args="$(_read_lines "${BX_RUNTIME_ARGS:-}")"
+
 # Where to keep the lock and the recorded shape. Callers usually point this at
 # a per-project, git-ignored directory; without a hint, use the XDG state dir
 # so an installed bx works from any directory.
@@ -1670,6 +1709,16 @@ $_want_mounts"
 # back from disk are byte-identical. Without this, an empty mount list leaves a
 # stray blank line that makes a machine look like it changed shape every run.
 _want_shape="${_want_shape%$'\n'}"
+# `runtime_args` are bound at create time (they become part of the create argv),
+# so they belong in the shape core: changing them cannot be applied to a running
+# machine, and silently reusing one created with different flags is the same
+# class of bug as reusing one with a different mount set. Recorded only when
+# set, so a machine made before this key existed still matches and reuses.
+if [[ -n "$_want_runtime_args" ]]; then
+  _want_shape="${_want_shape}
+runtime_args:
+${_want_runtime_args}"
+fi
 
 # Parse the secret list once, into the args the backend needs plus the
 # lifetimes bx records. The declared lifetime is a property of the shape, so a
@@ -1713,6 +1762,21 @@ if [[ "$_secret_lifetimes_record" == *"=persisted"* ]]; then
   _persisted_secret=1
 else
   _persisted_secret=0
+fi
+
+# `runtime_args` are the backend's own flags, and bx passes them through
+# without reading them. That is useful — it is how a capability the backend has
+# but bx has no vocabulary for (running a container inside a container, say) is
+# declared from a recipe — but it is also the one place a recipe can widen the
+# fence, since a flag like podman's `--privileged` reaches well past the mount
+# set bx controls. So it is explicit-only (never inferred, never defaulted) and
+# warned about at create time, the same way a `persisted` secret is. The
+# warning is about the machine's shape, so it fires on create, not on every
+# warm attach; `--status` always carries it and `-v` shows it on any run.
+if [[ -n "$_want_runtime_args" ]]; then
+  _runtime_args_set=1
+else
+  _runtime_args_set=0
 fi
 
 # The shape's stable core is the create-time binding the backend fixes:
@@ -1782,6 +1846,7 @@ backend=%s\nimage=%s\ncpus=%s\nmem=%s\nnet=%s\nworkdir=%s\naction=%s\nlock=%s\ns
   # because of the image; say which of the two applies, from state, so the
   # wait is predicted rather than discovered.
   [[ -n "$_secret_lifetimes_record" ]] && printf 'secret_lifetimes:\n%s\n' "$_secret_lifetimes_record"
+  [[ -n "$_want_runtime_args" ]] && printf 'runtime_args:\n%s\n' "$_want_runtime_args"
   printf 'cache_image=%s\ncache_toolchain=%s\n' "$(_image_cached "$_image")" "$(_toolchain_present)"
   case "$_action" in
     create|recreate)
@@ -1846,6 +1911,17 @@ if [[ "$_exists" == "0" ]]; then
   _run_say "creating $_vm_name from $_image (first run; this may take a minute)"
   [[ "$_persisted_secret" == "1" ]] && \
     _run_note "this machine declares a persisted secret; its value may reach a durable path"
+  # `runtime_args` are the backend's own flags, and bx does not read them. The
+  # one worth naming is the widening one; say what was handed over, verbatim,
+  # so it is never a surprise what the fence was opened with.
+  if [[ "$_runtime_args_set" == "1" ]]; then
+    _runtime_args_shown=""
+    while IFS= read -r _arg; do
+      [[ -n "$_arg" ]] || continue
+      _runtime_args_shown="${_runtime_args_shown}${_runtime_args_shown:+ }${_arg}"
+    done < <(printf '%s\n' "$_want_runtime_args")
+    _run_note "this machine passes raw runtime flags: ${_runtime_args_shown}. bx does not interpret these; a flag like --privileged reaches past the mount fence."
+  fi
   _backend_create
   printf '%s\n' "$_want_shape" >"$_state_file"
 else

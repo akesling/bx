@@ -360,6 +360,30 @@ test_net_mode_choice_is_documented() {
   _pass
 }
 
+# `runtime_args` is the one key that widens the fence, so the claim that bx
+# never infers it is load-bearing. Pin it against the source and the docs: the
+# key must be absent from every default, and the README must still say that a
+# recipe has to ask for it.
+test_runtime_args_are_never_inferred() {
+  _current="runtime_args are documented, explicit-only, and warned about"
+  local _readme="${_repo_root}/README.md" _bx="${_repo_root}/bin/bx"
+  if ! grep -qF 'runtime_args' "$_readme"; then
+    _fail "README no longer documents runtime_args"
+    return
+  fi
+  # The only mentions of --privileged in bx itself must be prose, never a
+  # default handed to a backend. If a future change adds one, this catches it.
+  if grep -nE '^\s*_create_args\+=\(.*--privileged' "$_bx" >/dev/null 2>&1; then
+    _fail "bx now injects --privileged itself; it must only pass recipe flags through"
+    return
+  fi
+  if ! grep -qiE 'warn' "$_readme"; then
+    _fail "README no longer says runtime_args are warned about at create time"
+    return
+  fi
+  _pass
+}
+
 # ── real: isolation, only when asked ────────────────────────────────────────
 # This is the claim the README leads with: the host home directory is not
 # mounted. It cannot be tested with a fake smolvm, so it is opt-in.
@@ -403,6 +427,7 @@ test_boot_probe_accepts_macos
 test_containers_claim_is_documented
 test_backend_choice_is_documented
 test_net_mode_choice_is_documented
+test_runtime_args_are_never_inferred
 
 if [[ "${BX_REAL:-0}" == "1" ]]; then
   # Use the shipping predicate, not a copy: a bare /dev/kvm check would skip
