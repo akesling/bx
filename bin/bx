@@ -318,14 +318,25 @@ _choose_backend() {
   local _available _n_available
   _n_available=0
   # Count the newline-separated list *before* joining it, or `wc -l` sees a
-  # single line and every ambiguity looks like a lone backend.
+  # single line and every ambiguity looks like a lone backend. `_read_lines`
+  # absorbs a producer that exits non-zero (the list function returns 1 when
+  # nothing is available), so `set -o pipefail` cannot turn an empty list into
+  # a silent exit before the `no backend installed` message can be printed.
   while IFS= read -r _one; do
     [[ -n "$_one" ]] && _n_available=$((_n_available + 1))
-  done < <(_backend_available_list)
-  _available="$(_backend_available_list | tr '\n' ' ')"
+  done < <(_backend_available_list || true)
+  _available="$(_backend_available_list | tr '\n' ' ' || true)"
   _available="${_available% }"
 
   if [[ "$_n_available" == "0" ]]; then
+    # `--dry-run` is inspection and its contract is that it needs no runtime:
+    # plan with the default backend and let the plan say it is not installed,
+    # rather than refusing to describe a machine the user is only inspecting.
+    if [[ "$_dry_run" == "1" ]]; then
+      _backend="${_BACKEND_NAMES[0]}"
+      _backend_present=0
+      return 0
+    fi
     _die "no backend installed: none of $(printf '%s ' "${_BACKEND_NAMES[@]}")is on PATH.
 Install smolvm (a microVM) or podman (a container), then run again."
   fi
@@ -615,7 +626,7 @@ _usage() {
 # the checkout that holds this script when it is one, else from the installed
 # manifest, else `unknown` — never guessed.
 _show_version() {
-  local _self _dir _commit _describe _installed
+  local _self _dir _commit _describe _installed _recorded
   _self="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo .)"
   _commit=""
   _describe=""
@@ -625,14 +636,18 @@ _show_version() {
     _describe="$(git -C "${_self}/.." describe --tags --always --dirty 2>/dev/null)"
   fi
   # An install: the commit recorded by install.sh, beside the recipe book.
-  if [[ -z "$_describe" ]]; then
-    for _installed in "${_self}/../share/bx/build" "$_self/../build"; do
-      [[ -f "$_installed" ]] && { _describe="$(head -1 "$_installed")"; break; }
-    done
-  fi
+  _recorded=""
+  for _installed in "${_self}/../share/bx/build" "$_self/../build"; do
+    [[ -f "$_installed" ]] && { _recorded="$(head -1 "$_installed")"; break; }
+  done
+  [[ -n "$_describe" ]] || _describe="$_recorded"
   printf 'bx %s\n' "${_describe:-${_commit:-unknown}}"
   printf 'script: %s\n' "$_self/$(basename "${BASH_SOURCE[0]}")"
   [[ -n "$_commit" ]] && printf 'commit: %s\n' "$_commit"
+  # An installed script carries no git metadata of its own, so a `build` file
+  # that disagrees with the script is only visible if both are reported. This
+  # is how a stale `~/.local/bin/bx` stops being invisible.
+  [[ -n "$_recorded" ]] && printf 'recorded: %s\n' "$_recorded"
   printf 'recipes: %s\n' "${BX_RECIPES_DIR:-$(_recipes_dir)}"
   printf 'machines: %s\n' "${BX_MACHINES_DIR:-$(_machines_dir)}"
 }
@@ -1139,7 +1154,11 @@ _run_resolver() {
   # the recipe *without* the values it exists to supply — for `pi`, no name, no
   # secrets, no model — and run something the user did not ask for.
   local _out _resolver_status
-  _out="$(mktemp)" || _die "could not create a temp file for the resolver output"
+  # A template is required: macOS `mktemp` rejects a bare invocation, so
+  # `_out=$(mktemp)` fails there with a usage message and no file. Use the
+  # portable form with an explicit template under $TMPDIR.
+  _out="$(mktemp "${TMPDIR:-/tmp}/bx-resolver.XXXXXX")" || \
+    _die "could not create a temp file for the resolver output"
   set +e
   BX_RECIPE="$_name" BX_RECIPE_DIR="$_book" "$_exe" >"$_out"
   _resolver_status=$?

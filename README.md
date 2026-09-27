@@ -258,9 +258,12 @@ bx sandbox                 # no backend named
 ```
 
 A run that cannot answer the question — a pipe, a CI job, a TTY-less process —
-is an error naming both choices rather than a silent pick. `--dry-run` never
-prompts, because inspection must not block; it prints the backend it would
-choose. To settle the question once and for all, name it in the recipe
+is an error naming both choices rather than a silent pick. A host with
+*neither* runtime installed is likewise an error that names both, not a bare
+exit: a machine that cannot run anything still has to say why. `--dry-run`
+never prompts, because inspection must not block; it prints the backend it would
+choose, and still produces a plan when no runtime is installed at all. To settle
+the question once and for all, name it in the recipe
 (`backend = podman`) or the environment (`BX_BACKEND=podman`), and bx will not
 ask again.
 

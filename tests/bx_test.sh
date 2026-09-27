@@ -23,6 +23,9 @@ _bx="${_repo_root}/bin/bx"
 _passed=0
 _failed=0
 _current=""
+# Set by `_backend_free_path` on first use; initialised so the EXIT trap can
+# reference it safely under `set -u` even when no test asked for it.
+_backend_free_bin=""
 
 _fail() { printf 'not ok - %s: %s\n' "$_current" "$*" >&2; _failed=$((_failed + 1)); }
 _ok() { _passed=$((_passed + 1)); }
@@ -229,13 +232,35 @@ CONF
 
 _install_fake_smolvm
 _install_fake_nesting
-trap '_remove_fake_smolvm; _remove_fake_podman; _remove_fake_nesting' EXIT
+trap '_remove_fake_smolvm; _remove_fake_podman; _remove_fake_nesting; [[ -n "$_backend_free_bin" ]] && rm -rf "$_backend_free_bin"' EXIT
 
 _new_workdir() {
   local d
   d="$(mktemp -d)"
   mkdir -p "$d/local"
   printf '%s\n' "$d"
+}
+
+# A PATH holding the tools bx needs but no runtime backend. A test whose point
+# is "only podman is installed" must not see the host's smolvm, and a developer
+# with smolvm installed system-wide would otherwise get a false failure that
+# has nothing to do with bx: a backend in `/usr/bin` (or a real one) turns the
+# intended single-backend case into an ambiguous one. Symlinking the handful of
+# tools bx and the harness use is stable; excluding whole system directories is
+# not, because it would also drop the tools.
+_backend_free_path() {
+  if [[ -z "$_backend_free_bin" ]]; then
+    _backend_free_bin="$(mktemp -d)"
+    local _t _p
+    for _t in bash sh env printf test \
+              sed grep awk tr cut sort uniq head tail wc \
+              cat ls mkdir rmdir rm cp mv ln pwd dirname basename \
+              mktemp chmod touch id uname date sleep kill; do
+      _p="$(command -v "$_t" 2>/dev/null)" || continue
+      ln -sf "$_p" "${_backend_free_bin}/${_t}"
+    done
+  fi
+  printf '%s' "$_backend_free_bin"
 }
 
 # ── dry-run is deterministic and names the plan ─────────────────────────────
@@ -952,6 +977,38 @@ EOF
   rm -rf "$_rhome" "$_rproj"
 }
 
+# macOS `mktemp` requires a template; a bare `mktemp` exits 1 with a usage
+# message. `_run_resolver` once used the bare form, so every recipe with a
+# resolver failed on macOS. Pin the portable form: put a strict mktemp first on
+# PATH and require a successful resolve.
+test_recipe_resolver_temp_file_is_portable() {
+  _current="the resolver's temp file does not assume GNU mktemp"
+  local out _strict
+  _recipe_env
+  _strict="$(mktemp -d)"
+  cat >"${_strict}/mktemp" <<'EOF'
+#!/usr/bin/env bash
+# Faithful macOS behaviour: no template is an error; a template works.
+if [[ $# -eq 0 ]]; then
+  printf 'mktemp: too few arguments\n' >&2
+  exit 1
+fi
+exec /bin/mktemp "$@"
+EOF
+  chmod +x "${_strict}/mktemp"
+  cat >"${_rproj}/ok.resolve" <<'EOF'
+#!/usr/bin/env bash
+printf 'name=portable\n'
+EOF
+  chmod +x "${_rproj}/ok.resolve"
+  printf '[p]\nresolve = ok.resolve\nimage = alpine\nmounts = /a:/a\ncommand = true\n' >"$_rproj/.bx.conf"
+  out="$(cd "$_rproj" && HOME="$_rhome" BX_RECIPES_DIR="$_rproj" \
+    PATH="${_strict}:$PATH" "$_bx" --show p 2>&1)"
+  assert_contains "name=portable" "$out" "a resolver succeeds under a strict mktemp"
+  assert_not_contains "too few arguments" "$out" "no bare mktemp invocation leaked"
+  rm -rf "$_rhome" "$_rproj" "$_strict"
+}
+
 test_recipe_new_scaffolds() {
   _current="--new writes a starter recipe into the user's book"
   local out
@@ -1389,7 +1446,7 @@ test_backend_uses_the_only_installed_backend() {
   # exercise the auto-choice. Only podman is on PATH, so no prompt is needed.
   out="$(cd "$d" && env -u BX_BACKEND BX_VERBOSE=1 BX_NAME=infonly BX_MOUNTS="/only:/only" \
     BX_COMMAND="true" BX_STATE_DIR="$d/local" \
-    PATH="${_fake_podman_dir}:/usr/bin:/bin" "$_bx" 2>&1)"
+    PATH="${_fake_podman_dir}:$(_backend_free_path)" "$_bx" 2>&1)"
   calls="$(cat "$_fake_podman_log" 2>/dev/null)"
   assert_contains "exec" "$calls" "runs through podman"
   rm -rf "$d"
@@ -1404,8 +1461,43 @@ test_backend_prompt_forces_a_question() {
   d="$(_new_workdir)"
   out="$(cd "$d" && env -u BX_BACKEND BX_BACKEND_PROMPT=1 BX_NAME=forced \
     BX_MOUNTS="/only:/only" BX_COMMAND="true" BX_STATE_DIR="$d/local" \
-    PATH="${_fake_podman_dir}:/usr/bin:/bin" "$_bx" 2>&1)"
+    PATH="${_fake_podman_dir}:$(_backend_free_path)" "$_bx" 2>&1)"
   assert_contains "not interactive" "$out" "asks despite a single backend"
+  rm -rf "$d"
+}
+
+# With no backend installed at all, bx must say so. It once exited 1 with no
+# output: `_backend_available_list` returns non-zero when nothing is found, and
+# under `set -o pipefail` the command substitution that joins the list failed,
+# so `set -e` aborted before the `no backend installed` message was reached.
+# A machine that cannot run anything still has to explain itself.
+test_no_backend_is_never_a_silent_exit() {
+  _current="no backend on PATH is reported, not silently exited"
+  local d out rc
+  d="$(_new_workdir)"
+  out="$(cd "$d" && env -u BX_BACKEND BX_NAME=none BX_MOUNTS="/only:/only" \
+    BX_COMMAND="true" BX_STATE_DIR="$d/local" \
+    PATH="$(_backend_free_path)" "$_bx" 2>&1)"
+  rc=$?
+  assert_eq "1" "$rc" "fails when no backend is installed"
+  assert_contains "no backend installed" "$out" "names the problem"
+  assert_contains "smolvm" "$out" "names smolvm as a choice"
+  assert_contains "podman" "$out" "names podman as a choice"
+  rm -rf "$d"
+}
+
+# The same empty list must not break `--dry-run`, whose contract is that it
+# needs no runtime: bx plans with the default backend and says it is absent.
+test_dry_run_plans_without_a_backend() {
+  _current="--dry-run plans even when no backend is installed"
+  local d out rc
+  d="$(_new_workdir)"
+  out="$(cd "$d" && env -u BX_BACKEND BX_DRY_RUN=1 BX_NAME=noback \
+    BX_MOUNTS="/only:/only" BX_COMMAND="true" BX_STATE_DIR="$d/local" \
+    PATH="$(_backend_free_path)" "$_bx" 2>&1)"
+  rc=$?
+  assert_eq "0" "$rc" "dry-run succeeds with no backend"
+  assert_contains "estimate=" "$out" "still prints the plan"
   rm -rf "$d"
 }
 
@@ -1658,6 +1750,7 @@ test_recipe_resolver_secrets_stay_out_of_show
 test_recipe_resolver_missing_is_reported
 test_recipe_resolver_failure_stops_the_run
 test_recipe_resolver_failure_does_not_emit_partial_plan
+test_recipe_resolver_temp_file_is_portable
 test_recipe_new_scaffolds
 test_recipe_profile_hands_off
 test_recipe_machine_is_a_separate_dir
@@ -1687,6 +1780,8 @@ test_backend_is_part_of_the_shape
 test_backend_asks_when_both_are_installed
 test_backend_uses_the_only_installed_backend
 test_backend_prompt_forces_a_question
+test_no_backend_is_never_a_silent_exit
+test_dry_run_plans_without_a_backend
 test_explicit_backend_never_prompts
 test_container_backend_secret_stays_out_of_argv
 test_dry_run_reports_backend
