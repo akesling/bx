@@ -196,6 +196,61 @@ CONF
   rm -rf "$d"
 }
 
+# Depth composes by *scope*, not by inheritance: the inner machine records the
+# inner recipe's mounts and origin, and knows nothing of the outer's. This is
+# the claim that a directory visible at depth 1 is not visible at depth 2
+# unless the depth-2 recipe asks for it — asserted on the state each level
+# writes, which is what bx actually binds.
+test_bx_in_bx_mounts_do_not_widen_with_depth() {
+  _current="a depth-2 machine's mounts are its own, not the depth-1 set"
+  local d out
+  d="$(_new_workdir)"
+  mkdir -p "$d/outer-only" "$d/work/inner-only"
+  # The inner recipe mounts only its own subdirectory; a path the outer machine
+  # can see is deliberately outside it.
+  cat >"$d/work/.bx.conf" <<CONF
+[inner]
+backend = podman
+image   = debian:bookworm-slim
+mounts  = \$PWD/inner-only:/data
+command = true
+CONF
+  cat >"$d/.bx.conf" <<CONF
+[outer]
+backend = podman
+image   = debian:bookworm-slim
+mounts  = $d/work:/work
+command = BX_BACKEND=podman BX_STATE_DIR=inner-state BX_NAME=inner \
+            PATH=$_fake_nesting_dir:\$PATH ${_bx} inner
+CONF
+  out="$(cd "$d" && BX_BACKEND=podman BX_NAME=outer BX_STATE_DIR="$d/outer-state" \
+    BX_FAKE_GUEST_WORK="$d/work" PATH="${_fake_nesting_dir}:$PATH" "$_bx" outer 2>&1)"
+  local inner_state="$d/work/inner-state/inner.state"
+  if [[ ! -f "$inner_state" ]]; then
+    _fail "the inner machine did not record state: $out"
+    rm -rf "$d"; return
+  fi
+  local recorded
+  recorded="$(cat "$inner_state")"
+  # The inner machine must name the inner mount and the inner origin, and must
+  # not carry the outer mount. The mount is recorded expanded ($PWD resolved),
+  # which is the point: it is the *inner* path, not the outer's `/work`.
+  assert_contains "$d/work/inner-only:/data" "$recorded" \
+    "the inner machine records its own declared mount"
+  assert_not_contains "$d/work:/work" "$recorded" \
+    "the inner machine inherited the outer mount"
+  # Match the whole origin line, so `origin=/outer` is not "found" as a prefix
+  # of `origin=/outer/work`.
+  assert_contains "origin=$d/work" "$recorded" \
+    "the inner machine's origin is the inner directory"
+  if printf '%s\n' "$recorded" | grep -qxF "origin=$d"; then
+    _fail "the inner machine's origin is the outer directory"
+  else
+    _ok
+  fi
+  rm -rf "$d"
+}
+
 # The lock is per machine *name*, and names are per level, so an inner machine
 # must stay reachable even while an outer one is held. This is the property
 # that makes recursion safe rather than merely possible.
@@ -2409,6 +2464,7 @@ test_lock_parity
 test_shape_reconcile_parity
 test_cleanup_parity
 test_bx_in_bx_composes
+test_bx_in_bx_mounts_do_not_widen_with_depth
 test_bx_in_bx_locks_are_per_level
 
 printf '\n%d passed, %d failed\n' "$_passed" "$_failed"

@@ -352,9 +352,21 @@ it) nests once more. Mounts compose the same way and just as explicitly — a
 child sees exactly the mounts its own recipe names, so a directory visible at
 depth 1 is not visible at depth 2 unless the depth-2 recipe asks for it.
 
-The fence holds at every depth. A depth-2 test reads the depth-1 machine's
-`/root/.bx-nested-sentinel` and the depth-1 host directory and is refused
-both; it sees only its own declared mounts. The recorded shape reconciles at
+The fence holds at every depth, and it is asserted, not assumed. The
+`BX_REAL=1` suite boots the `nested_podman` machine, runs a second `bx`
+inside it, and has that child boot a grandchild container. It plants a
+sentinel in the depth-1 machine's own rootfs, outside every mount, and asks
+the grandchild to read it — and to read a sibling host directory that was
+never mounted — and requires both to fail. The test also asserts the
+grandchild actually ran, so the fence is proved by silence and not by a
+machine that never booted. Composition is checked without a runtime too: the
+suite asserts that a depth-2 machine's recorded shape carries its *own* mounts
+and origin and not the depth-1 set, so a mount cannot widen silently as depth
+grows. Nesting is exercised on `podman` only; a vm needs a hypervisor and
+nested virtualization, and the container path is the one bx ships for
+recursion. It skips cleanly where `podman` cannot boot.
+
+The recorded shape reconciles at
 every level too — changing the inner recipe's `net` or `runtime_args` is a
 shape conflict one layer down, with the same diff and the same `--reset`.
 
@@ -693,7 +705,9 @@ asserted on **both** backends — exit status, the lock, shape reconciliation,
 and cleanup are run once per backend — because a guarantee that only holds for
 one runtime is not a guarantee bx can make. Nesting is tested by running a real
 second `bx` as the outer machine's command, so depth-2 composition is exercised
-rather than assumed.
+rather than assumed; the suite also asserts that a depth-2 machine's recorded
+shape carries its own mounts and not the outer set, so depth cannot widen a
+mount silently.
 
 `tests/invariants.sh` is the second suite: it turns each `never`/`only` claim
 in these docs into an assertion, and greps everything bx writes for a sentinel
@@ -702,6 +716,10 @@ that boots a machine and checks the isolation fence directly. It runs on
 whichever backend can actually boot — a vm where a hypervisor exists, a
 container where `podman` works (including a host that is itself a bx machine) —
 so the fence is asserted on the container backend too, not only on smolvm.
+`BX_REAL=1` also carries the depth-2 fence test: it boots `nested_podman`, runs
+a second `bx` inside it, and requires a grandchild container to be unable to
+read a sentinel in the depth-1 machine's rootfs or a host sibling directory.
+That test is podman-only and skips cleanly where `podman` cannot boot.
 
 `scripts/demo.sh` shows the boundary (and refuses to fake it without a real
 `smolvm`); `scripts/bench.sh` produces the Cost table above, and prints no

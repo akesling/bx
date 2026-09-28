@@ -214,6 +214,7 @@ test_claims_are_backed() {
     "out of its own state files:test_secret_absent_from_state_and_show"
     "A piped run is silent:test_piped_run_is_silent"
     "A curated environment is forwarded:test_env_passthrough_is_curated"
+    "The fence holds at every depth:test_real_nested_fence_holds"
   )
   local _c _phrase _fn
   for _c in "${_claims[@]}"; do
@@ -224,8 +225,13 @@ test_claims_are_backed() {
       _missing="${_missing} claim-not-in-docs:'${_phrase}'"
       continue
     fi
-    # ...and the named test must exist to back it.
-    if ! grep -q "^${_fn}()" "${BASH_SOURCE[0]}"; then
+    # ...and the named test must exist to back it. A claim may name a test in
+    # either suite: the fake-runtime contract lives in bx_test.sh, and the
+    # real/depth tests live here. Checking both is what keeps a doc from
+    # citing a test that was renamed or never written — the failure mode that
+    # let the depth-2 fence claim name a sentinel no test looked for.
+    if ! grep -qE "^${_fn}\\(\\)" "${BASH_SOURCE[0]}" \
+       && ! grep -qE "^${_fn}\\(\\)" "${_repo_root}/tests/bx_test.sh"; then
       _missing="${_missing} claim-without-test:'${_phrase}' -> ${_fn}"
     fi
   done
@@ -561,8 +567,7 @@ test_real_project_is_mounted() { # backend
 # A mount the recipe does *not* name must not appear, whatever the backend.
 # This is the negative form of the project-mount test, and the property that
 # keeps nesting from widening by accident: the child sees its own mounts only.
-test_real_undeclared_path_is_absent() { # backend
-  local _b="$1" d out sibling _name _needle
+test_real_undeclared_path_is_absent() { # backend  local _b="$1" d out sibling _name _needle
   _current="[$_b] a path that is not mounted is not visible"
   d="$(_new_tmp)"
   _name="$(_real_name "$_b" unmnt)"
@@ -575,6 +580,96 @@ test_real_undeclared_path_is_absent() { # backend
     BX_STATE_DIR="$d/state" BX_KEEP=0 "$_bx" 2>&1)"
   assert_absent "$_needle" "$out" "[$_b] a sibling directory leaked into the machine"
   _real_cleanup "$_b" "$_name"
+  rm -rf "$d" "$sibling"
+}
+
+# ── nesting: the fence holds at depth 2 ─────────────────────────────────────
+# The claim that nesting is *safe* — not merely possible — is that a depth-2
+# machine sees only its own declared mounts. This boots the shipped
+# `nested_podman` machine (a privileged container whose bootstrap installs
+# podman over a vfs store), runs a second bx inside it, and has that child
+# boot a grandchild container. It then has the grandchild try to read two
+# things it must not be able to:
+#
+#   * a sentinel in the depth-1 machine's own rootfs, outside /work, which the
+#     depth-1 machine can write but the depth-2 machine cannot read; and
+#   * a sibling host directory that was never mounted at any level.
+#
+# Only podman is exercised: a vm needs a hypervisor and nested virtualization,
+# and the point here is that the *container* path composes. Skipped cleanly
+# where podman cannot boot a nested-capable machine.
+_nested_podman_can_boot() {
+  local d
+  d="$(_new_tmp)"
+  if ( cd "$d" && BX_BACKEND=podman BX_NAME="bxinv-nest-probe-$$" \
+       BX_COMMAND=true BX_RESET=1 BX_MACHINE=nested_podman \
+       BX_MOUNTS="$d:/work" BX_WORKDIR=/work \
+       BX_STATE_DIR="$d/state" "$_bx" >/dev/null 2>&1 ); then
+    _real_cleanup podman "bxinv-nest-probe-$$"
+    rm -rf "$d"; return 0
+  fi
+  rm -rf "$d"; return 1
+}
+
+# The depth-2 fence test proper. The design is: the depth-1 machine plants a
+# sentinel in its own rootfs, writes an inner recipe that asks a grandchild to
+# read both sentinels, and runs a second bx inside itself. Neither sentinel
+# may reach the grandchild's output.
+test_real_nested_fence_holds() {
+  _current="[podman] a depth-2 machine cannot see depth-1's files or host"
+  local d sibling out h r name
+  name="bxinv-nest-outer-$$"
+  d="$(_new_tmp)"
+  sibling="$(mktemp -d)"
+  h="LEAKEDHOST_$(date +%s)_$RANDOM"
+  r="LEAKEDROOT_$(date +%s)_$RANDOM"
+  printf '%s\n' "$h" >"$sibling/secret"
+
+  # The inner recipe the depth-1 machine will hand to a second bx. The
+  # grandchild mounts only the shared project directory and runs two reads it
+  # must not get:
+  #   * the depth-1 machine's own rootfs sentinel at /root/.bx-nested-sentinel
+  #     (outside every mount, so only a leaked rootfs could expose it); and
+  #   * a host sibling directory that was never mounted at any level.
+  # It needs no special capability: it is a plain container, and the point is
+  # that ordinary `bx` composes, not that a privileged one does.
+  cat >"$d/inner.conf" <<CONF
+[inner]
+backend = podman
+image   = docker.io/library/debian:bookworm-slim
+cpus    = 2
+mem     = 1024
+mounts  = /work:/inner
+workdir = /inner
+command = echo INNER-RAN; cat /root/.bx-nested-sentinel 2>&1 || true; cat $sibling/secret 2>&1 || true
+CONF
+
+  # The depth-1 command: plant the sentinel in the depth-1 machine's own rootfs
+  # (outside /work, so no mount can carry it inward), then run a second bx
+  # inside the depth-1 machine against the inner recipe. State is relative so
+  # it lands under the shared mount.
+  local cmd
+  cmd="printf '%s' $r > /root/.bx-nested-sentinel; "
+  cmd+='cd /work && cp inner.conf .bx.conf && '
+  cmd+='BX_BACKEND=podman BX_STATE_DIR=inner-state BX_NAME=inner-nested '
+  cmd+='bx inner; echo NESTED-DONE'
+
+  _real_cleanup podman "$name"
+  ( cd "$d" && BX_BACKEND=podman BX_NAME="$name" BX_RESET=1 \
+      BX_MACHINE=nested_podman BX_MOUNTS="$d:/work" BX_WORKDIR=/work \
+      BX_STATE_DIR="$d/state" \
+      BX_COMMAND="$cmd" "$_bx" >"$d/out" 2>&1 ) || true
+
+  out="$(cat "$d/out" 2>/dev/null || true)"
+  # Positive control first: if the grandchild never ran, the two negative
+  # assertions below would pass vacuously. `INNER-RAN` proves a depth-2 machine
+  # actually booted inside the depth-1 machine, so their silence means the
+  # fence held rather than that nothing happened.
+  assert_present "INNER-RAN" "$out" "[podman] the depth-2 machine did not run"
+  assert_absent "$h" "$out" "[podman] depth-2 read a depth-1 host sibling"
+  assert_absent "$r" "$out" "[podman] depth-2 read depth-1's own rootfs"
+
+  _real_cleanup podman "$name"
   rm -rf "$d" "$sibling"
 }
 
@@ -620,6 +715,7 @@ if [[ "${BX_REAL:-0}" == "1" ]]; then
   # but not a vm (a CI container, or bx nested in bx) now exercises the fence
   # instead of skipping the whole suite.
   _ran_real=0
+  _podman_boots=0
   for _candidate in smolvm podman; do
     if _real_backend_runnable "$_candidate"; then
       printf 'bx-invariants: real suite on %s\n' "$_candidate" >&2
@@ -627,10 +723,23 @@ if [[ "${BX_REAL:-0}" == "1" ]]; then
       test_real_project_is_mounted "$_candidate"
       test_real_undeclared_path_is_absent "$_candidate"
       _ran_real=1
+      [[ "$_candidate" == "podman" ]] && _podman_boots=1
     fi
   done
   if [[ "$_ran_real" == "0" ]]; then
     printf 'bx-invariants: BX_REAL=1 but no backend can boot here; skipping real suite\n' >&2
+  fi
+
+  # Nesting is exercised on podman only: a vm needs a hypervisor and nested
+  # virtualization, and the container path is the one this project ships for
+  # recursion. Booting a plain container is necessary but not sufficient —
+  # the nested machine is privileged and installs podman over a vfs store, so
+  # it is probed separately and skipped cleanly when it cannot boot.
+  if [[ "$_podman_boots" == "1" ]] && _nested_podman_can_boot; then
+    printf 'bx-invariants: nested podman suite\n' >&2
+    test_real_nested_fence_holds
+  else
+    printf 'bx-invariants: nested_podman cannot boot here; skipping the depth-2 suite\n' >&2
   fi
 fi
 
