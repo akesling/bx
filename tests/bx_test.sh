@@ -1045,18 +1045,26 @@ EOF
 # PATH and require a successful resolve.
 test_recipe_resolver_temp_file_is_portable() {
   _current="the resolver's temp file does not assume GNU mktemp"
-  local out _strict
+  local out _strict _real_mktemp
   _recipe_env
   _strict="$(mktemp -d)"
-  cat >"${_strict}/mktemp" <<'EOF'
+  # The wrapper must delegate to the real mktemp, but the fake directory goes
+  # first on PATH, so resolving by name would recurse into the wrapper. Find
+  # the real one before that, and never hardcode a path: macOS keeps it in
+  # /usr/bin, Linux in /bin, and a blanket /bin/mktemp fails on macOS.
+  _real_mktemp="$(command -v mktemp)" || {
+    _fail "no mktemp on PATH to delegate to"
+    return 1
+  }
+  cat >"${_strict}/mktemp" <<WRAPPER
 #!/usr/bin/env bash
 # Faithful macOS behaviour: no template is an error; a template works.
-if [[ $# -eq 0 ]]; then
+if [[ \$# -eq 0 ]]; then
   printf 'mktemp: too few arguments\n' >&2
   exit 1
 fi
-exec /bin/mktemp "$@"
-EOF
+exec ${_real_mktemp} "\$@"
+WRAPPER
   chmod +x "${_strict}/mktemp"
   cat >"${_rproj}/ok.resolve" <<'EOF'
 #!/usr/bin/env bash
