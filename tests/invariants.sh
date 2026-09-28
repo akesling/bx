@@ -567,7 +567,8 @@ test_real_project_is_mounted() { # backend
 # A mount the recipe does *not* name must not appear, whatever the backend.
 # This is the negative form of the project-mount test, and the property that
 # keeps nesting from widening by accident: the child sees its own mounts only.
-test_real_undeclared_path_is_absent() { # backend  local _b="$1" d out sibling _name _needle
+test_real_undeclared_path_is_absent() { # backend
+  local _b="$1" d out sibling _name _needle
   _current="[$_b] a path that is not mounted is not visible"
   d="$(_new_tmp)"
   _name="$(_real_name "$_b" unmnt)"
@@ -625,15 +626,55 @@ test_real_nested_fence_holds() {
   r="LEAKEDROOT_$(date +%s)_$RANDOM"
   printf '%s\n' "$h" >"$sibling/secret"
 
-  # The inner recipe the depth-1 machine will hand to a second bx. The
-  # grandchild mounts only the shared project directory and runs two reads it
+  # A command recipe that does what `nested_podman` does, plus bx installed
+  # into the guest. Nesting bx requires bx to exist at depth 1; the shipped
+  # `nested_podman` installs podman but not bx, and `bootstrap` is
+  # single-valued (extends overrides it), so this is declared whole rather than
+  # inherited. It mirrors `nested_podman`'s shape and adds the read-only
+  # checkout mount and the bx install.
+  #
+  # The inner recipe is written by the host (below) into `inner.dir`, a
+  # subdirectory of the project, so the depth-1 machine sees it at
+  # /work/inner.dir/.bx.conf. The depth-1 command plants the sentinel in its
+  # OWN rootfs (/root, outside every mount), then runs a second bx from
+  # inner.dir. The inner bx's state is relative, so it does not collide with
+  # the outer machine's state under /work and does not live on the project.
+  cat >"$d/.bx.conf" <<CONF
+[nested_bx]
+backend      = podman
+image        = docker.io/library/debian:bookworm-slim
+cpus         = 4
+mem          = 4096
+net          = host
+runtime_args = --privileged
+runtime_args = --cgroupns=host
+mounts       = \$PWD:/work
+mounts       = ${_repo_root}:/bx-src:ro
+workdir      = /work
+command      = printf '${r}' > /root/.bx-nested-sentinel; cd /work/inner.dir && BX_BACKEND=podman BX_STATE_DIR=state BX_NAME=inner-nested bx inner; echo NESTED-DONE
+bootstrap = set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    if ! command -v podman >/dev/null 2>&1; then
+      apt-get update -q
+      apt-get install -yq --no-install-recommends podman ca-certificates
+    fi
+    if [[ ! -f /etc/containers/storage.conf ]]; then
+      mkdir -p /etc/containers /work/.bx/containers/storage
+      printf '[storage]\\ndriver = "vfs"\\nrunroot = "/run/containers/storage"\\ngraphroot = "/work/.bx/containers/storage"\\n' \\
+        > /etc/containers/storage.conf
+    fi
+    if ! command -v bx >/dev/null 2>&1; then
+      install -m 0755 /bx-src/bin/bx /usr/local/bin/bx
+    fi
+CONF
+
+  # The inner recipe, read by the second bx from inner.dir in the shared mount.
+  # It mounts only the project directory and is asked to read two things it
   # must not get:
-  #   * the depth-1 machine's own rootfs sentinel at /root/.bx-nested-sentinel
-  #     (outside every mount, so only a leaked rootfs could expose it); and
+  #   * the depth-1 rootfs sentinel at /root/.bx-nested-sentinel; and
   #   * a host sibling directory that was never mounted at any level.
-  # It needs no special capability: it is a plain container, and the point is
-  # that ordinary `bx` composes, not that a privileged one does.
-  cat >"$d/inner.conf" <<CONF
+  mkdir -p "$d/inner.dir"
+  cat >"$d/inner.dir/.bx.conf" <<CONF
 [inner]
 backend = podman
 image   = docker.io/library/debian:bookworm-slim
@@ -644,21 +685,10 @@ workdir = /inner
 command = echo INNER-RAN; cat /root/.bx-nested-sentinel 2>&1 || true; cat $sibling/secret 2>&1 || true
 CONF
 
-  # The depth-1 command: plant the sentinel in the depth-1 machine's own rootfs
-  # (outside /work, so no mount can carry it inward), then run a second bx
-  # inside the depth-1 machine against the inner recipe. State is relative so
-  # it lands under the shared mount.
-  local cmd
-  cmd="printf '%s' $r > /root/.bx-nested-sentinel; "
-  cmd+='cd /work && cp inner.conf .bx.conf && '
-  cmd+='BX_BACKEND=podman BX_STATE_DIR=inner-state BX_NAME=inner-nested '
-  cmd+='bx inner; echo NESTED-DONE'
-
   _real_cleanup podman "$name"
   ( cd "$d" && BX_BACKEND=podman BX_NAME="$name" BX_RESET=1 \
-      BX_MACHINE=nested_podman BX_MOUNTS="$d:/work" BX_WORKDIR=/work \
       BX_STATE_DIR="$d/state" \
-      BX_COMMAND="$cmd" "$_bx" >"$d/out" 2>&1 ) || true
+      "$_bx" nested_bx >"$d/out" 2>&1 ) || true
 
   out="$(cat "$d/out" 2>/dev/null || true)"
   # Positive control first: if the grandchild never ran, the two negative
