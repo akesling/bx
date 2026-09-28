@@ -455,6 +455,38 @@ test_setup_failures_are_never_silent() {
   _pass
 }
 
+# `bx exec` is the one command that borrows a machine rather than owning it.
+# The claim in the README is specific — no create, no start, no stop, no lock —
+# and it is load-bearing, so grep the exec block for the lifecycle verbs. A
+# future edit that makes exec "helpfully" start a stopped machine would widen
+# what inspecting a running bot does, and this is what would catch it.
+test_exec_does_not_own_the_lifecycle_documented() {
+  _current="exec is documented and coded as not owning the lifecycle"
+  local body _readme="${_repo_root}/README.md"
+  # The block between the exec heading and the next section heading.
+  body="$(sed -n '/── exec: borrow a machine/,/^fi$/p' "$_bx")"
+  [[ -n "$body" ]] || { _fail "no exec block found in bx"; return; }
+  for _verb in _backend_create _backend_start _backend_stop _backend_delete; do
+    if [[ "$body" == *"$_verb"* ]]; then
+      _fail "the exec path calls $_verb; exec must not own the lifecycle"
+      return
+    fi
+  done
+  if [[ "$body" == *"_lock_dir"* ]]; then
+    _fail "the exec path takes the lifecycle lock; it must not"
+    return
+  fi
+  if ! grep -qF "It does not create, start, stop, or lock" "$_readme"; then
+    _fail "README no longer states that exec does not own the lifecycle"
+    return
+  fi
+  if ! grep -qF "It attaches only to a running machine" "$_readme"; then
+    _fail "README no longer states that exec refuses a stopped machine"
+    return
+  fi
+  _pass
+}
+
 # ── real: isolation, on whichever backend can actually run ──────────────────
 # The fence is bx's reason to exist, so it must be asserted on every backend
 # that can boot, not only the vm. These take the backend as an argument: the
@@ -579,6 +611,8 @@ test_net_mode_choice_is_documented
 test_runtime_args_are_never_inferred
 test_backend_contract_is_asserted_on_every_backend
 test_setup_failures_are_never_silent
+
+test_exec_does_not_own_the_lifecycle_documented
 
 if [[ "${BX_REAL:-0}" == "1" ]]; then
   # Run the fence on every backend that can actually boot here, not just the

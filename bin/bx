@@ -4,6 +4,10 @@
 #
 # Usage:
 #   bx <recipe> [args...]   # run a recipe (e.g. `bx pi`)
+#   bx exec <command>       # run a command in this directory's machine, and
+#                           # do not create, start, stop, or lock it (exec is
+#                           # the one reserved word; every other bare word is
+#                           # a recipe). `--name` picks a specific machine.
 #   bx -v <recipe>          # also show the lifecycle commands bx runs
 #   bx -q <recipe>          # errors only
 #   bx --list               # list available recipes
@@ -168,6 +172,7 @@ _quiet_or_die() {
 #   `_BACKEND_PROGRAMS[i]`  the program on PATH, e.g. `smolvm`
 #   `_BACKEND_LABELS[i]`    the noun a person reads: `microVM` or `container`
 #   `bk_<name>_exists`     is there a machine by this name?
+#   `bk_<name>_running`    is it running now (what `exec` can attach to)?
 #   `bk_<name>_create_args` build the create argv into `_create_args`
 #   `bk_<name>_create`     create it (uses `_create_args`)
 #   `bk_<name>_start`      start it
@@ -398,6 +403,12 @@ bk_smolvm_exists() {
   smolvm machine ls -q 2>/dev/null | grep -qx "$_vm_name"
 }
 
+# smolvm's `machine ls` lists running machines; a created-but-stopped one is
+# absent, which is exactly the distinction `bx exec` needs before attaching.
+bk_smolvm_running() {
+  smolvm machine ls -q 2>/dev/null | grep -qx "$_vm_name"
+}
+
 bk_smolvm_create() {
   _quiet_or_die "could not create machine $_vm_name" \
     smolvm machine create "${_create_args[@]}"
@@ -509,6 +520,12 @@ bk_podman_exists() {
   podman ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$_vm_name"
 }
 
+# `podman ps -a` answers `exists`; `podman ps` narrows it to running. A stopped
+# container can be exec'd into only after a start, which `bx exec` must not do.
+bk_podman_running() {
+  podman ps --format '{{.Names}}' 2>/dev/null | grep -qx "$_vm_name"
+}
+
 bk_podman_create() {
   _quiet_or_die "could not create container $_vm_name" \
     podman create "${_create_args[@]}"
@@ -609,6 +626,7 @@ _backend_start()  { _bk start; }
 _backend_stop()   { _bk stop; }
 _backend_delete() { _bk delete; }
 _backend_exec()   { _bk exec "$@"; }
+_backend_running() { _bk running; }
 _backend_image_cached()    { _bk image_cached "$1"; }
 _backend_toolchain_present() { _bk toolchain_present; }
 _backend_create_args() { _bk create_args; }
@@ -1416,6 +1434,7 @@ _show_status=""
 _gc=""
 BX_PROFILE=""
 _name_overridden=""
+_exec=""
 _passthrough=()
 # Flags bx consumed for itself, kept so they can be replayed to a profile
 # recipe, which owns its own machine and therefore wants --reset/--keep too.
@@ -1442,14 +1461,32 @@ while [[ $# -gt 0 ]]; do
     --show=*)  _show="${1#*=}"; shift ;;
     -h|--help) _usage; exit 0 ;;
     --)        shift; _passthrough+=("$@"); break ;;
+    exec)
+      # The one reserved bare word. Every other bare word is a recipe. `exec`
+      # runs a command in a machine that already exists, borrowing it rather
+      # than owning it: no create, no start, no stop, no lifecycle lock. It
+      # matches `docker exec` / `kubectl exec`, which is what a person reaches
+      # for to look inside something already running.
+      #
+      # Enter exec mode and keep parsing: bx's own flags (--name, -v, ...) may
+      # follow `exec`, so `bx exec --name=x ls` selects a machine and runs
+      # `ls`. The first token that is not a bx flag starts the guest command;
+      # `--` is the escape when that command begins with a dash.
+      _exec=1; shift ;;
     -*)
       # Before a recipe is named, an unknown option is a mistake. After one, it
       # belongs to the recipe: `bx pi --reset -p hi` forwards both to the
-      # recipe's command.
-      if [[ -n "$_recipe" ]]; then _passthrough+=("$1"); shift
+      # recipe's command. In exec mode a dash that matches no bx flag belongs
+      # to the command being run, so it starts the command rather than erroring:
+      # `bx exec ls -la` must not read `-la` as a bx option.
+      if [[ -n "$_exec" ]]; then _passthrough+=("$@"); break
+      elif [[ -n "$_recipe" ]]; then _passthrough+=("$1"); shift
       else _die "unknown option: $1 (see --help)"; fi ;;
     *)
-      if [[ -z "$_recipe" ]]; then _recipe="$1"; shift
+      # In exec mode the first bare word is the command, and everything after
+      # it is that command's arguments, passed through untouched.
+      if [[ -n "$_exec" ]]; then _passthrough+=("$@"); break
+      elif [[ -z "$_recipe" ]]; then _recipe="$1"; shift
       else _passthrough+=("$1"); shift; fi ;;
   esac
 done
@@ -1646,6 +1683,71 @@ if [[ -n "$BX_PROFILE" ]]; then
   # Replay the flags bx parsed for itself first, then the recipe's own args:
   # the profile owns the machine, so --reset/--keep/--dry-run are its to honor.
   exec "$BX_PROFILE" ${_own_flags[@]+"${_own_flags[@]}"} ${_passthrough[@]+"${_passthrough[@]}"}
+fi
+
+# ── exec: borrow a machine, do not own it ────────────────────────────────────
+# `bx exec <cmd>` runs a command in a machine that already exists. It does not
+# create, start, stop, or lock, because it is not the machine's driver: the
+# `bx` that created the machine owns its lifecycle, and an inspection must not
+# end the thing it is inspecting. The machine is found by the directory it came
+# from (`origin` in its state), the same way a run finds the machine to reuse,
+# so `bx exec ls /work/foo` works in the directory you ran `bx pi` in without
+# naming anything.
+if [[ -n "$_exec" ]]; then
+  _exec_cmd=""
+  for _arg in ${_passthrough[@]+"${_passthrough[@]}"}; do
+    printf -v _quoted '%q' "$_arg"
+    _exec_cmd="${_exec_cmd} ${_quoted}"
+  done
+  _exec_cmd="${_exec_cmd# }"
+  [[ -n "$_exec_cmd" ]] || _die "exec needs a command: bx exec <command> [args...]"
+
+  _exec_dir="$(_origin_dir)"
+  _exec_name="${BX_NAME:-}"
+  if [[ -z "$_exec_name" ]]; then
+    # The machine whose origin is this directory. More than one is possible
+    # (a second machine made with --name), so say which was chosen rather than
+    # silently picking: the wrong machine is the surprise this avoids.
+    _exec_match=""
+    _exec_count=0
+    while IFS= read -r _n; do
+      [[ -n "$_n" ]] || continue
+      _f="$(_resolve_state_dir)/${_n}.state"
+      [[ "$(_state_field "$_f" origin)" == "$_exec_dir" ]] || continue
+      _exec_count=$((_exec_count + 1))
+      _exec_match="$_n"
+    done < <(_state_machines)
+    if [[ "$_exec_count" == "0" ]]; then
+      _die "no machine for $_exec_dir. Start one first (bx pi, bx bash, ...), or name one with --name."
+    fi
+    if [[ "$_exec_count" -gt 1 ]]; then
+      _die "$_exec_dir has $_exec_count machines; name one with --name <machine>"
+    fi
+    _exec_name="$_exec_match"
+  fi
+
+  _exec_state="$(_resolve_state_dir)/${_exec_name}.state"
+  [[ -f "$_exec_state" ]] || \
+    _die "no machine named '$_exec_name' (no state at $_exec_state)"
+  _backend="$(_state_field "$_exec_state" backend)"
+  [[ -n "$_backend" ]] || _backend="$(_bk_legacy_backend)"
+  _bk_known "$_backend" || \
+    _die "machine '$_exec_name' records unknown backend '$_backend'"
+  _vm_name="$_exec_name"
+  _bk_available "$_backend" || \
+    _die "machine '$_exec_name' uses backend '$_backend', which is not on PATH"
+  _backend_running || \
+    _die "machine '$_exec_name' is not running. bx exec attaches to a running
+machine; start it with the recipe that owns it (bx pi, bx bash, ...), or
+recreate it with --reset."
+
+  if [[ -t 0 && -t 1 ]]; then
+    _backend_exec 1 "$_exec_cmd"
+  else
+    _backend_exec 0 "$_exec_cmd"
+  fi
+  # No trap owns cleanup here, so the guest status is the whole story.
+  exit $?
 fi
 
 _image="${BX_IMAGE:-debian:bookworm-slim}"

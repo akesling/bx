@@ -363,6 +363,44 @@ reach, which is the opposite of the fence the rest of bx maintains. It is
 offered because recursion is a real use, not because it is safe by default.
 See [What bx does not control](#what-bx-does-not-control).
 
+#### Looking inside a machine without owning it
+
+A machine that is running a bot is a thing you sometimes want to inspect
+without disturbing it — see what the bot has written, what a directory holds,
+whether a file is there. Creating or restarting a machine to do that would be
+the wrong answer, so bx has one word for borrowing an existing one:
+
+```sh
+bx exec ls /work/foo         # a command in this directory's machine
+bx exec -- cat /work/.log    # -- when the command starts with a dash
+bx exec --name=pi-bx ls /work
+```
+
+`exec` is the **one reserved bare word** — every other bare word is a recipe.
+It matches `docker exec` and `kubectl exec`, which is what a person reaches for
+to look inside something already running.
+
+What it guarantees, and why it is safe next to a bot that is mid-run:
+
+- **It does not create, start, stop, or lock.** It is not the machine's
+driver; the `bx` that created the machine owns its lifecycle. `exec` can run
+while that `bx` holds the machine's lock — that is the point.
+- **It attaches only to a running machine.** A stopped machine is an error,
+not a reason to start one, because starting changes what is running.
+- **The command's status is `exec`'s status**, the same as any run.
+- **The machine is found by directory.** `exec` looks up the machine whose
+`origin` is the current directory, so it works in the directory you ran
+`bx pi` in without naming anything. If more than one machine came from that
+directory, `exec` refuses and names them rather than guessing.
+- **No bootstrap, no secrets unless a recipe supplies them.** `exec` runs what
+you gave it; it does not re-provision the machine.
+
+Beware the one interaction: a normal `bx pi` **stops its machine when it
+exits** (unless `--keep`). If the bot's run ends while your `exec` is in
+flight, the machine goes away underneath it. To inspect a machine that must
+stay up across commands, run the owner with `--keep`, or use `backend = podman`
+where the container's own lifecycle is separate from bx's.
+
 
 ## Costs
 

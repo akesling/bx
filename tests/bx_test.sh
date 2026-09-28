@@ -79,7 +79,14 @@ _install_fake_podman() {
 printf '%s\n' "\$*" >>"$(printf '%q' "$_fake_podman_log")"
 case "\$1" in
   ps)
-    for _n in \${FAKE_CONTAINERS:-}; do printf '%s\n' "\$_n"; done
+    # The -a form lists every container; without it, only running ones. Keep
+    # them separately controllable so a test can tell a stopped machine from a
+    # running one — exec attaches only to the running set.
+    if [[ "\$*" == *" -a "* || "\$*" == *" -a"* ]]; then
+      for _n in \${FAKE_CONTAINERS:-}; do printf '%s\n' "\$_n"; done
+    else
+      for _n in \${FAKE_RUNNING:-\${FAKE_CONTAINERS:-}}; do printf '%s\n' "\$_n"; done
+    fi
     ;;
   image)
     [[ "\${FAKE_IMAGE_CACHED:-0}" == "1" ]] && exit 0 || exit 1
@@ -1655,6 +1662,191 @@ test_backends_implement_the_same_verbs() {
   assert_eq "$_sm" "$_pd" "backends disagree on the verb set"
 }
 
+# ── exec: borrow a running machine, do not own it ───────────────────────────
+# `bx exec` is the inspection path: look inside the machine a bot is running
+# in, run one command, and leave. The guarantees are negative — it must not
+# create, start, stop, or lock — because the whole value is that it is safe to
+# run against a machine someone else is driving.
+
+# The happy path: an origin-matched machine is found, attached to, and the
+# command's status is this command's status.
+test_exec_runs_in_the_directorys_machine() {
+  _current="exec finds this directory's machine and propagates its status"
+  local d out rc
+  d="$(_new_workdir)"
+  cat >"$d/local/em.state" <<STATE
+image=debian:bookworm-slim
+cpus=4
+mem=4096
+net=bridge
+backend=smolvm
+mounts:
+$d:/work
+origin=$d
+STATE
+  out="$(cd "$d" && FAKE_VMS=em FAKE_EXEC_RC=0 BX_STATE_DIR="$d/local" \
+    PATH="${_fake_bin_dir}:$PATH" "$_bx" exec ls -la /work/foo 2>&1)"
+  rc=$?
+  assert_eq "0" "$rc" "exec succeeds"
+  # The command reaches the guest as a single shell line, arguments intact.
+  assert_contains "machine exec --name em -- bash -lc ls -la /work/foo" \
+    "$(cat "$_fake_log")" "the command is forwarded to the machine"
+
+  # A non-zero guest status is not flattened.
+  : >"$_fake_log"
+  (cd "$d" && FAKE_VMS=em FAKE_EXEC_RC=42 BX_STATE_DIR="$d/local" \
+    PATH="${_fake_bin_dir}:$PATH" "$_bx" exec false >/dev/null 2>&1)
+  rc=$?
+  assert_eq "42" "$rc" "exec propagates the guest status"
+  rm -rf "$d"
+}
+
+# The defining negative: exec touches nothing about the lifecycle.
+test_exec_does_not_own_the_lifecycle() {
+  _current="exec never creates, starts, stops, or locks"
+  local d calls
+  d="$(_new_workdir)"
+  cat >"$d/local/eo.state" <<STATE
+image=debian:bookworm-slim
+cpus=4
+mem=4096
+net=bridge
+backend=smolvm
+mounts:
+$d:/work
+origin=$d
+STATE
+  : >"$_fake_log"
+  (cd "$d" && FAKE_VMS=eo BX_STATE_DIR="$d/local" \
+    PATH="${_fake_bin_dir}:$PATH" "$_bx" exec true >/dev/null 2>&1)
+  calls="$(cat "$_fake_log")"
+  assert_contains "machine exec" "$calls" "it does exec"
+  assert_not_contains "machine create" "$calls" "it does not create"
+  assert_not_contains "machine start" "$calls" "it does not start"
+  assert_not_contains "machine stop" "$calls" "it does not stop"
+  if [[ -d "$d/local/eo.lock.d" ]]; then
+    _fail "exec took the lifecycle lock"
+  else
+    _ok
+  fi
+  rm -rf "$d"
+}
+
+# exec must be usable *while* the machine is held by the bx that owns it —
+# that is the entire point: peeking at a bot that is currently running.
+test_exec_works_while_the_lifecycle_lock_is_held() {
+  _current="exec attaches even when the owning run holds the lock"
+  local d out rc holder
+  d="$(_new_workdir)"
+  cat >"$d/local/el.state" <<STATE
+image=debian:bookworm-slim
+cpus=4
+mem=4096
+net=bridge
+backend=smolvm
+mounts:
+$d:/work
+origin=$d
+STATE
+  mkdir -p "$d/local/el.lock.d"
+  sleep 300 &
+  holder=$!
+  printf '%s\n' "$holder" >"$d/local/el.lock.d/pid"
+  out="$(cd "$d" && FAKE_VMS=el BX_STATE_DIR="$d/local" \
+    PATH="${_fake_bin_dir}:$PATH" "$_bx" exec true 2>&1)"
+  rc=$?
+  kill "$holder" 2>/dev/null || true
+  assert_eq "0" "$rc" "exec is not blocked by the lifecycle lock"
+  rm -rf "$d"
+}
+
+# An absent machine is an error, not an excuse to create one: inspecting a bot
+# that is not there must not silently boot a different machine.
+test_exec_refuses_a_missing_machine() {
+  _current="exec refuses when there is no machine for the directory"
+  local d out rc
+  d="$(_new_workdir)"
+  out="$(cd "$d" && BX_STATE_DIR="$d/local" \
+    PATH="${_fake_bin_dir}:$PATH" "$_bx" exec ls 2>&1)"
+  rc=$?
+  assert_eq "1" "$rc" "exec fails with no machine"
+  assert_contains "no machine for" "$out" "says there is no machine"
+  assert_contains "bx pi" "$out" "names how to start one"
+  assert_not_contains "create" "$(cat "$_fake_log")" "it did not create anything"
+  rm -rf "$d"
+}
+
+# A machine that exists but is stopped is also a refusal: exec does not start
+# it, because starting is the owner's job and would change what is running.
+test_exec_refuses_a_stopped_machine() {
+  _current="exec refuses to start a stopped machine"
+  local d out rc calls
+  d="$(_new_workdir)"
+  cat >"$d/local/es.state" <<STATE
+image=debian:bookworm-slim
+cpus=4
+mem=4096
+net=bridge
+backend=smolvm
+mounts:
+$d:/work
+origin=$d
+STATE
+  : >"$_fake_log"
+  out="$(cd "$d" && FAKE_VMS="" BX_STATE_DIR="$d/local" \
+    PATH="${_fake_bin_dir}:$PATH" "$_bx" exec ls 2>&1)"
+  rc=$?
+  calls="$(cat "$_fake_log")"
+  assert_eq "1" "$rc" "exec fails on a stopped machine"
+  assert_contains "is not running" "$out" "says it is stopped"
+  assert_not_contains "machine start" "$calls" "it did not start it"
+  rm -rf "$d"
+}
+
+# Two machines in one directory is ambiguous, and guessing is the surprise to
+# avoid: exec names the conflict and asks for --name.
+test_exec_refuses_an_ambiguous_directory() {
+  _current="exec refuses to guess between two machines in one directory"
+  local d out rc
+  d="$(_new_workdir)"
+  local n
+  for n in amb1 amb2; do
+    cat >"$d/local/$n.state" <<STATE
+image=debian:bookworm-slim
+cpus=4
+mem=4096
+net=bridge
+backend=smolvm
+mounts:
+$d:/work
+origin=$d
+STATE
+  done
+  out="$(cd "$d" && FAKE_VMS="amb1 amb2" BX_STATE_DIR="$d/local" \
+    PATH="${_fake_bin_dir}:$PATH" "$_bx" exec ls 2>&1)"
+  rc=$?
+  assert_eq "1" "$rc" "exec fails when the directory is ambiguous"
+  assert_contains "--name" "$out" "asks for the machine to be named"
+
+  # Naming one resolves it.
+  out="$(cd "$d" && FAKE_VMS="amb1 amb2" BX_STATE_DIR="$d/local" \
+    PATH="${_fake_bin_dir}:$PATH" "$_bx" exec --name=amb2 ls 2>&1)"
+  rc=$?
+  assert_eq "0" "$rc" "--name picks a machine"
+  rm -rf "$d"
+}
+
+# exec must not require a recipe or a command to be named for the machine: the
+# machine is the directory's, so a bare command is the whole invocation.
+test_exec_needs_a_command() {
+  _current="exec with no command is a clear error"
+  local out rc
+  out="$("$_bx" exec 2>&1)"
+  rc=$?
+  assert_eq "1" "$rc" "exec with no command fails"
+  assert_contains "bx exec <command>" "$out" "shows the form"
+}
+
 # ── the backend contract, exercised on *both* backends ──────────────────────
 # Verb presence is not a contract. These run the same observable behaviour
 # through each backend and assert the behaviour, not the wiring: a podman exec
@@ -2205,6 +2397,13 @@ test_no_runtime_args_is_the_default
 # here, where the fix is obvious. The parity tests go further: presence is not
 # a contract, so the same observable behaviour is asserted on both backends.
 test_backends_implement_the_same_verbs
+test_exec_runs_in_the_directorys_machine
+test_exec_does_not_own_the_lifecycle
+test_exec_works_while_the_lifecycle_lock_is_held
+test_exec_refuses_a_missing_machine
+test_exec_refuses_a_stopped_machine
+test_exec_refuses_an_ambiguous_directory
+test_exec_needs_a_command
 test_exit_status_parity
 test_lock_parity
 test_shape_reconcile_parity
