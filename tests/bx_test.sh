@@ -23,6 +23,37 @@ _bx="${_repo_root}/bin/bx"
 _passed=0
 _failed=0
 _current=""
+
+# Progress. A suite this size is silent for minutes, which reads as a hang; a
+# test that boots a machine is worse. Each test is announced on stderr as it
+# starts, so a stall names the test it stalled in. stdout stays clean, and a
+# piped run (CI) stays quiet unless BX_TEST_PROGRESS is set — the same rule bx
+# itself follows for narration. Off by default when stderr is not a terminal.
+if [[ -n "${BX_TEST_PROGRESS:-}" ]]; then
+  _progress="${BX_TEST_PROGRESS}"
+  [[ "$_progress" == "0" ]] && _progress=0 || _progress=1
+elif [[ -t 2 ]]; then
+  _progress=1
+else
+  _progress=0
+fi
+_ran_tests=0
+# The total is the number of `_run_test` call sites, counted once from this
+# file. Self-maintaining: adding a test adds to the denominator for free.
+_total_tests="$(grep -cE '^_run_test test_' "${BASH_SOURCE[0]}" 2>/dev/null || echo 0)"
+_run_test() { # function-name
+  _ran_tests=$((_ran_tests + 1))
+  if [[ "$_progress" == "1" ]]; then
+    printf '\r\033[K[%3d/%3d] %s' "$_ran_tests" "$_total_tests" "$1" >&2
+  fi
+  "$1"
+}
+_finish_progress() {
+  if [[ "$_progress" == "1" && "$_ran_tests" -gt 0 ]]; then
+    printf '\r\033[K' >&2
+  fi
+  return 0
+}
 # Set by `_backend_free_path` on first use; initialised so the EXIT trap can
 # reference it safely under `set -u` even when no test asked for it.
 _backend_free_bin=""
@@ -1549,8 +1580,10 @@ test_backend_asks_when_both_are_installed() {
   : >"$_fake_podman_log"
   # Both are available on PATH and no backend is named. Without a terminal the
   # prompt cannot be answered, so bx must fail naming both choices rather than
-  # silently picking one.
-  out="$(cd "$d" && env -u BX_BACKEND BX_NAME=amb BX_MOUNTS="/only:/only" \
+  # silently picking one. BX_NO_TTY pins that condition: the test must not
+  # change behaviour depending on whether the suite was launched from a
+  # terminal (or under `script`), only on the code path it is exercising.
+  out="$(cd "$d" && env -u BX_BACKEND BX_NO_TTY=1 BX_NAME=amb BX_MOUNTS="/only:/only" \
     BX_COMMAND="true" BX_STATE_DIR="$d/local" FAKE_VMS= \
     PATH="${_fake_bin_dir}:${_fake_podman_dir}:$PATH" "$_bx" 2>&1)"
   assert_contains "not interactive" "$out" "refuses to guess without a terminal"
@@ -1583,7 +1616,7 @@ test_backend_prompt_forces_a_question() {
   _current="backend_prompt asks even when only one backend is installed"
   local d out
   d="$(_new_workdir)"
-  out="$(cd "$d" && env -u BX_BACKEND BX_BACKEND_PROMPT=1 BX_NAME=forced \
+  out="$(cd "$d" && env -u BX_BACKEND BX_NO_TTY=1 BX_BACKEND_PROMPT=1 BX_NAME=forced \
     BX_MOUNTS="/only:/only" BX_COMMAND="true" BX_STATE_DIR="$d/local" \
     PATH="${_fake_podman_dir}:$(_backend_free_path)" "$_bx" 2>&1)"
   assert_contains "not interactive" "$out" "asks despite a single backend"
@@ -2020,83 +2053,83 @@ test_cleanup_parity() {
 _install_fake_smolvm
 trap '_remove_fake_smolvm; _remove_fake_podman' EXIT
 
-test_dry_run_plan
-test_conflict_on_changed_mounts
-test_reuse_on_unchanged_shape
-test_reset_recreates
-test_lock_blocks_live_holder
-test_lock_recovers_from_dead_holder
-test_quiet_silences_notes_but_not_errors
-test_verbose_shows_smolvm_commands
-test_piped_run_is_quiet
-test_env_passthrough_is_curated
-test_signal_reaches_foreground_job
-test_bootstrap_comment_does_not_end_value
-test_guest_exit_status_propagates
-test_empty_input_does_not_abort
-test_failing_pre_command_is_reported
-test_redirected_pre_command_failure_is_still_reported
-test_failing_bootstrap_is_reported
-test_successful_pre_command_is_silent_and_status_passes_through
-test_cpu_change_conflicts
-test_unknown_option_is_rejected
-test_invalid_machine_name_is_rejected
-test_recipe_lookup_and_merge
-test_recipe_mounts_accumulate
-test_recipe_variable_expansion
-test_recipe_unknown_key_is_rejected
-test_recipe_unknown_name_is_rejected
-test_recipe_list
-test_version_reports_the_build
-test_recipe_list_shows_description
-test_recipe_list_marks_machines
-test_recipe_typo_suggests_the_close_name
-test_recipe_typo_far_away_suggests_nothing
-test_recipe_book_is_not_compiled_in
-test_recipe_extends_inherits_scalars_and_lists
-test_recipe_resolver_emits_values
-test_recipe_resolver_secrets_stay_out_of_show
-test_recipe_resolver_missing_is_reported
-test_recipe_resolver_failure_stops_the_run
-test_recipe_resolver_failure_does_not_emit_partial_plan
-test_recipe_resolver_temp_file_is_portable
-test_recipe_new_scaffolds
-test_recipe_profile_hands_off
-test_recipe_machine_is_a_separate_dir
-test_recipe_machine_overrides
-test_recipe_machine_flag_replaces_shape
-test_recipe_machine_flag_via_env
-test_recipe_machine_unknown_is_reported
-test_recipe_machine_self_reference_is_rejected
-test_recipe_flat_file_holds_both_kinds
-test_recipe_hyphen_name_is_rejected
-test_recipe_machine_recipe_has_no_command
-test_recipe_machine_extends_inherits
+_run_test test_dry_run_plan
+_run_test test_conflict_on_changed_mounts
+_run_test test_reuse_on_unchanged_shape
+_run_test test_reset_recreates
+_run_test test_lock_blocks_live_holder
+_run_test test_lock_recovers_from_dead_holder
+_run_test test_quiet_silences_notes_but_not_errors
+_run_test test_verbose_shows_smolvm_commands
+_run_test test_piped_run_is_quiet
+_run_test test_env_passthrough_is_curated
+_run_test test_signal_reaches_foreground_job
+_run_test test_bootstrap_comment_does_not_end_value
+_run_test test_guest_exit_status_propagates
+_run_test test_empty_input_does_not_abort
+_run_test test_failing_pre_command_is_reported
+_run_test test_redirected_pre_command_failure_is_still_reported
+_run_test test_failing_bootstrap_is_reported
+_run_test test_successful_pre_command_is_silent_and_status_passes_through
+_run_test test_cpu_change_conflicts
+_run_test test_unknown_option_is_rejected
+_run_test test_invalid_machine_name_is_rejected
+_run_test test_recipe_lookup_and_merge
+_run_test test_recipe_mounts_accumulate
+_run_test test_recipe_variable_expansion
+_run_test test_recipe_unknown_key_is_rejected
+_run_test test_recipe_unknown_name_is_rejected
+_run_test test_recipe_list
+_run_test test_version_reports_the_build
+_run_test test_recipe_list_shows_description
+_run_test test_recipe_list_marks_machines
+_run_test test_recipe_typo_suggests_the_close_name
+_run_test test_recipe_typo_far_away_suggests_nothing
+_run_test test_recipe_book_is_not_compiled_in
+_run_test test_recipe_extends_inherits_scalars_and_lists
+_run_test test_recipe_resolver_emits_values
+_run_test test_recipe_resolver_secrets_stay_out_of_show
+_run_test test_recipe_resolver_missing_is_reported
+_run_test test_recipe_resolver_failure_stops_the_run
+_run_test test_recipe_resolver_failure_does_not_emit_partial_plan
+_run_test test_recipe_resolver_temp_file_is_portable
+_run_test test_recipe_new_scaffolds
+_run_test test_recipe_profile_hands_off
+_run_test test_recipe_machine_is_a_separate_dir
+_run_test test_recipe_machine_overrides
+_run_test test_recipe_machine_flag_replaces_shape
+_run_test test_recipe_machine_flag_via_env
+_run_test test_recipe_machine_unknown_is_reported
+_run_test test_recipe_machine_self_reference_is_rejected
+_run_test test_recipe_flat_file_holds_both_kinds
+_run_test test_recipe_hyphen_name_is_rejected
+_run_test test_recipe_machine_recipe_has_no_command
+_run_test test_recipe_machine_extends_inherits
 
 # New in S-tier: typed secrets, a cost model, and fleet legibility.
-test_secret_lifetime_defaults_ephemeral
-test_secret_lifetime_explicit
-test_secret_lifetime_typo_is_rejected
-test_secret_persisted_warns
-test_dry_run_reports_cost_model
-test_status_lists_a_machine
-test_status_marks_orphan
-test_gc_previews_then_deletes
-test_gc_keeps_live_machine
-test_old_state_file_still_reuses
-test_legacy_boolean_net_record_still_reuses
-test_legacy_net_record_still_detects_a_real_change
-test_container_backend_creates_and_execs
-test_backend_is_part_of_the_shape
-test_backend_asks_when_both_are_installed
-test_backend_uses_the_only_installed_backend
-test_backend_prompt_forces_a_question
-test_no_backend_is_never_a_silent_exit
-test_dry_run_plans_without_a_backend
-test_explicit_backend_never_prompts
-test_container_backend_secret_stays_out_of_argv
-test_dry_run_reports_backend
-test_unknown_backend_is_rejected
+_run_test test_secret_lifetime_defaults_ephemeral
+_run_test test_secret_lifetime_explicit
+_run_test test_secret_lifetime_typo_is_rejected
+_run_test test_secret_persisted_warns
+_run_test test_dry_run_reports_cost_model
+_run_test test_status_lists_a_machine
+_run_test test_status_marks_orphan
+_run_test test_gc_previews_then_deletes
+_run_test test_gc_keeps_live_machine
+_run_test test_old_state_file_still_reuses
+_run_test test_legacy_boolean_net_record_still_reuses
+_run_test test_legacy_net_record_still_detects_a_real_change
+_run_test test_container_backend_creates_and_execs
+_run_test test_backend_is_part_of_the_shape
+_run_test test_backend_asks_when_both_are_installed
+_run_test test_backend_uses_the_only_installed_backend
+_run_test test_backend_prompt_forces_a_question
+_run_test test_no_backend_is_never_a_silent_exit
+_run_test test_dry_run_plans_without_a_backend
+_run_test test_explicit_backend_never_prompts
+_run_test test_container_backend_secret_stays_out_of_argv
+_run_test test_dry_run_reports_backend
+_run_test test_unknown_backend_is_rejected
 
 # `net` is a mode, not a flag, and each mode has to reach the runtime as the
 # right flag. `none`/`bridge`/`host` are the vocabulary; `0`/`1` are kept as
@@ -2439,19 +2472,19 @@ CONF
   rm -rf "$d"
 }
 
-test_net_modes_reach_the_container
-test_net_boolean_still_means_a_mode
-test_net_bogus_mode_is_rejected
-test_net_mode_is_part_of_the_shape
-test_net_bridge_under_tsi_is_refused
-test_net_unset_under_tsi_uses_host
-test_net_bridge_approved_becomes_host
-test_net_bridge_kept_on_a_normal_host
-test_net_modes_reach_the_vm
-test_runtime_args_reach_the_create_argv
-test_runtime_args_are_part_of_the_shape
-test_runtime_args_are_reported
-test_no_runtime_args_is_the_default
+_run_test test_net_modes_reach_the_container
+_run_test test_net_boolean_still_means_a_mode
+_run_test test_net_bogus_mode_is_rejected
+_run_test test_net_mode_is_part_of_the_shape
+_run_test test_net_bridge_under_tsi_is_refused
+_run_test test_net_unset_under_tsi_uses_host
+_run_test test_net_bridge_approved_becomes_host
+_run_test test_net_bridge_kept_on_a_normal_host
+_run_test test_net_modes_reach_the_vm
+_run_test test_runtime_args_reach_the_create_argv
+_run_test test_runtime_args_are_part_of_the_shape
+_run_test test_runtime_args_are_reported
+_run_test test_no_runtime_args_is_the_default
 
 
 
@@ -2459,21 +2492,22 @@ test_no_runtime_args_is_the_default
 # backend that forgets one would fail at the call site, deep in a run; catch it
 # here, where the fix is obvious. The parity tests go further: presence is not
 # a contract, so the same observable behaviour is asserted on both backends.
-test_backends_implement_the_same_verbs
-test_exec_runs_in_the_directorys_machine
-test_exec_does_not_own_the_lifecycle
-test_exec_works_while_the_lifecycle_lock_is_held
-test_exec_refuses_a_missing_machine
-test_exec_refuses_a_stopped_machine
-test_exec_refuses_an_ambiguous_directory
-test_exec_needs_a_command
-test_exit_status_parity
-test_lock_parity
-test_shape_reconcile_parity
-test_cleanup_parity
-test_bx_in_bx_composes
-test_bx_in_bx_mounts_do_not_widen_with_depth
-test_bx_in_bx_locks_are_per_level
+_run_test test_backends_implement_the_same_verbs
+_run_test test_exec_runs_in_the_directorys_machine
+_run_test test_exec_does_not_own_the_lifecycle
+_run_test test_exec_works_while_the_lifecycle_lock_is_held
+_run_test test_exec_refuses_a_missing_machine
+_run_test test_exec_refuses_a_stopped_machine
+_run_test test_exec_refuses_an_ambiguous_directory
+_run_test test_exec_needs_a_command
+_run_test test_exit_status_parity
+_run_test test_lock_parity
+_run_test test_shape_reconcile_parity
+_run_test test_cleanup_parity
+_run_test test_bx_in_bx_composes
+_run_test test_bx_in_bx_mounts_do_not_widen_with_depth
+_run_test test_bx_in_bx_locks_are_per_level
 
+_finish_progress
 printf '\n%d passed, %d failed\n' "$_passed" "$_failed"
 [[ "$_failed" -eq 0 ]]

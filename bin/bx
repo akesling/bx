@@ -267,7 +267,12 @@ _backend_choose_interactively() { # available names as args
   # A run with no controlling terminal cannot answer, and it must not have a
   # runtime picked for it. Fail with both choices named, so a log or a CI job
   # carries the fix rather than a mystery.
-  if ! { exec 3</dev/tty; } 2>/dev/null; then
+  #
+  # BX_NO_TTY forces this branch, the way BX_HOST_OS forces the host probe: the
+  # tests must be able to pin "not interactive" regardless of how they were
+  # launched (a terminal runner, `script`, CI), because otherwise the same suite
+  # passes or prompts depending on the harness.
+  if [[ -n "${BX_NO_TTY:-}" ]] || ! { exec 3</dev/tty; } 2>/dev/null; then
     _die "no backend chosen and this run is not interactive.
 Install a runtime, or set the backend explicitly:
 $(for _n in "$@"; do printf '  backend = %s   (%s)\n' "$_n" "$(_bk_label "$_n")"; done)"

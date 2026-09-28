@@ -30,6 +30,38 @@ _passed=0
 _failed=0
 _current=""
 
+# Progress, on stderr, off unless stderr is a terminal (or BX_TEST_PROGRESS is
+# set). The real suite boots machines and can sit silent for minutes; naming
+# each test as it starts turns a suspected hang into a place to look.
+if [[ -n "${BX_TEST_PROGRESS:-}" ]]; then
+  _progress="${BX_TEST_PROGRESS}"
+  [[ "$_progress" == "0" ]] && _progress=0 || _progress=1
+elif [[ -t 2 ]]; then
+  _progress=1
+else
+  _progress=0
+fi
+_ran_tests=0
+# The host tests are fixed and countable; the real suite adds a variable number
+# (three per bootable backend, plus the nested test), so the denominator is a
+# lower bound that _run_test raises as real tests are added. It never shows
+# `n/m` with n > m, which would read as a bug in the harness.
+_total_tests="$(grep -cE '^_run_test test_' "${BASH_SOURCE[0]}" 2>/dev/null || echo 0)"
+_run_test() { # function-name [args...]
+  _ran_tests=$((_ran_tests + 1))
+  [[ "$_ran_tests" -gt "$_total_tests" ]] && _total_tests=$_ran_tests
+  if [[ "$_progress" == "1" ]]; then
+    printf '\r\033[K[%3d/%3d] %s' "$_ran_tests" "$_total_tests" "$*" >&2
+  fi
+  "$@"
+}
+_finish_progress() {
+  if [[ "$_progress" == "1" && "$_ran_tests" -gt 0 ]]; then
+    printf '\r\033[K' >&2
+  fi
+  return 0
+}
+
 _pass() { _passed=$((_passed + 1)); }
 _fail() { printf 'not ok - %s: %s\n' "$_current" "$*" >&2; _failed=$((_failed + 1)); }
 
@@ -722,22 +754,22 @@ _real_backend_runnable() { # backend -> 0 if it can boot on this host
 _install_fake() { :; }
 _remove_fake() { :; }
 
-test_secret_absent_from_state_and_show
-test_secret_absent_from_argv
-test_recipe_is_never_shell
-test_piped_run_is_silent
-test_env_passthrough_is_curated
-test_claims_are_backed
-test_dry_run_needs_no_smolvm
-test_boot_probe_accepts_macos
-test_containers_claim_is_documented
-test_backend_choice_is_documented
-test_net_mode_choice_is_documented
-test_runtime_args_are_never_inferred
-test_backend_contract_is_asserted_on_every_backend
-test_setup_failures_are_never_silent
+_run_test test_secret_absent_from_state_and_show
+_run_test test_secret_absent_from_argv
+_run_test test_recipe_is_never_shell
+_run_test test_piped_run_is_silent
+_run_test test_env_passthrough_is_curated
+_run_test test_claims_are_backed
+_run_test test_dry_run_needs_no_smolvm
+_run_test test_boot_probe_accepts_macos
+_run_test test_containers_claim_is_documented
+_run_test test_backend_choice_is_documented
+_run_test test_net_mode_choice_is_documented
+_run_test test_runtime_args_are_never_inferred
+_run_test test_backend_contract_is_asserted_on_every_backend
+_run_test test_setup_failures_are_never_silent
 
-test_exec_does_not_own_the_lifecycle_documented
+_run_test test_exec_does_not_own_the_lifecycle_documented
 
 if [[ "${BX_REAL:-0}" == "1" ]]; then
   # Run the fence on every backend that can actually boot here, not just the
@@ -749,9 +781,9 @@ if [[ "${BX_REAL:-0}" == "1" ]]; then
   for _candidate in smolvm podman; do
     if _real_backend_runnable "$_candidate"; then
       printf 'bx-invariants: real suite on %s\n' "$_candidate" >&2
-      test_real_home_is_not_mounted "$_candidate"
-      test_real_project_is_mounted "$_candidate"
-      test_real_undeclared_path_is_absent "$_candidate"
+      _run_test test_real_home_is_not_mounted "$_candidate"
+      _run_test test_real_project_is_mounted "$_candidate"
+      _run_test test_real_undeclared_path_is_absent "$_candidate"
       _ran_real=1
       [[ "$_candidate" == "podman" ]] && _podman_boots=1
     fi
@@ -767,11 +799,12 @@ if [[ "${BX_REAL:-0}" == "1" ]]; then
   # it is probed separately and skipped cleanly when it cannot boot.
   if [[ "$_podman_boots" == "1" ]] && _nested_podman_can_boot; then
     printf 'bx-invariants: nested podman suite\n' >&2
-    test_real_nested_fence_holds
+    _run_test test_real_nested_fence_holds
   else
     printf 'bx-invariants: nested_podman cannot boot here; skipping the depth-2 suite\n' >&2
   fi
 fi
 
+_finish_progress
 printf '%s passed, %s failed\n' "$_passed" "$_failed"
 [[ "$_failed" == 0 ]]
