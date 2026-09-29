@@ -101,14 +101,24 @@ _new_workdir() {
 
 # Run one `bx` invocation and print elapsed seconds, or nothing on failure.
 # Uses the shell's own clock, then reports; a failed run stays unmeasured.
+# The run's stderr is captured and replayed on failure: a bare `n/a` with no
+# reason is the same unhelpful silence the progress work set out to remove, and
+# a benchmark that cannot say why it failed cannot be fixed.
 _time_run() {
   local label="$1"; shift
-  local start end
-  start="$(date +%s.%N 2>/dev/null)" || return 1
-  if ! "$@" >/dev/null 2>&1; then
+  local start end _err _rc
+  _err="$(mktemp)"
+  start="$(date +%s.%N 2>/dev/null)" || { rm -f "$_err"; return 1; }
+  if ! "$@" >/dev/null 2>"$_err"; then
     _warn "${label}: run failed; leaving cell unmeasured"
+    if [[ -s "$_err" ]]; then
+      # Indent so the cause reads as part of the warning, not as new output.
+      sed 's/^/  bench:   /' "$_err" >&2
+    fi
+    rm -f "$_err"
     return 1
   fi
+  rm -f "$_err"
   end="$(date +%s.%N 2>/dev/null)" || return 1
   printf '%s\n' "$(awk -v a="$start" -v b="$end" 'BEGIN { printf "%.2f", b - a }')"
 }
@@ -125,6 +135,13 @@ _measure_allowed() {
 
 _run_bx() {
   local dir="$1"
+  # Pin the backend. The bench measures *smolvm*, and a host with both smolvm
+  # and podman installed would otherwise leave the backend ambiguous — bx then
+  # stops to ask, and the bench (no terminal) fails every run, reporting `n/a`
+  # for a reason that has nothing to do with boot time. BX_NO_TTY makes any
+  # remaining prompt a hard error rather than a hang.
+  BX_BACKEND="${BX_BENCH_BACKEND:-smolvm}" \
+  BX_NO_TTY=1 \
   BX_STATE_DIR="${dir}/local" \
   BX_MOUNTS="${dir}/proj:/work" \
   BX_WORKDIR=/work \

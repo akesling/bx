@@ -2477,6 +2477,36 @@ CONF
   rm -rf "$d"
 }
 
+# The bench harness must pin the backend it is measuring. It did not, and on a
+# host with both smolvm and podman installed the choice became ambiguous — bx
+# stopped to ask, the bench (no terminal) failed every run, and every cell
+# reported `n/a` with no reason. Pin the property, not the symptom: the run
+# helper must name a backend.
+test_bench_pins_the_backend_it_measures() {
+  _current="bench.sh selects a backend rather than leaving it ambiguous"
+  local bench="${_repo_root}/scripts/bench.sh"
+  [[ -f "$bench" ]] || { _fail "bench.sh not found"; return; }
+  if grep -qE 'BX_BACKEND=' "$bench"; then
+    _ok
+  else
+    _fail "bench.sh does not set BX_BACKEND; on a host with two runtimes it will fail every run"
+  fi
+}
+
+# A benchmark that cannot say why it failed cannot be fixed. The run helper
+# must replay the failed run's stderr, not discard it.
+test_bench_reports_why_a_run_failed() {
+  _current="bench.sh replays a failed run's stderr"
+  local bench="${_repo_root}/scripts/bench.sh"
+  [[ -f "$bench" ]] || { _fail "bench.sh not found"; return; }
+  # The old `>/dev/null 2>&1` on the timed run swallowed the cause.
+  if grep -qE '2>"\$_err"|2>"\$err"' "$bench"; then
+    _ok
+  else
+    _fail "bench.sh discards a failed run's stderr; a bare n/a has no diagnosis"
+  fi
+}
+
 _run_test test_net_modes_reach_the_container
 _run_test test_net_boolean_still_means_a_mode
 _run_test test_net_bogus_mode_is_rejected
@@ -2490,6 +2520,8 @@ _run_test test_runtime_args_reach_the_create_argv
 _run_test test_runtime_args_are_part_of_the_shape
 _run_test test_runtime_args_are_reported
 _run_test test_no_runtime_args_is_the_default
+_run_test test_bench_pins_the_backend_it_measures
+_run_test test_bench_reports_why_a_run_failed
 
 
 
