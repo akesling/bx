@@ -1851,7 +1851,12 @@ STATE
   out="$(cd "$d" && FAKE_VMS=el BX_STATE_DIR="$d/local" \
     PATH="${_fake_bin_dir}:$PATH" "$_bx" exec true 2>&1)"
   rc=$?
+  # Reap the stand-in holder. `kill` alone leaves a terminated job for bash to
+  # announce later — which lands in the middle of the progress line as
+  # "Terminated: 15 sleep 300". `wait` collects it so there is nothing to
+  # report, and discarding the status is fine: it was killed on purpose.
   kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
   assert_eq "0" "$rc" "exec is not blocked by the lifecycle lock"
   rm -rf "$d"
 }
